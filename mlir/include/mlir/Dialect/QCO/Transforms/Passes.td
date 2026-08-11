@@ -143,6 +143,16 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
     potentially find a more optimal solution. This is behavior is controlled by the `niterations` parameter.
 
     The pass option `ntrials` determines how many random initial layouts the pass explores. If compiled with multi-threading on, these trials will be executed in parallel.
+
+    The pass optionally supports a stateful A/B swap heuristic, opted into via the `qubit-type-labels` option. Each
+    program qubit is labeled either `A` (conventionally an auxiliary qubit) or `B` (conventionally a data qubit), and
+    the label is a permanent property of that program qubit that is looked up through the current (routed) layout as
+    SWAPs change which target site holds it. When enabled, `g(n)` no longer counts SWAPs uniformly; instead, every
+    SWAP on the path from the root to `n` contributes a type-dependent cost based on the labels of the two program
+    qubits it exchanges: `A<>A = 1`, `A<>B = 2`, `B<>B = 3`. This turns `g(n)` into `alpha * cost(n)`, where `cost(n)`
+    is the sum of the type-dependent costs of the SWAPs on that path, instead of `alpha * depth(n)`. `h(n)` is
+    unaffected. The heuristic is opt-in and disabled by default (`g(n) = alpha * depth(n)`, as above), preserving the
+    default routing behavior.
   }];
   let options = [Option<"nlookahead", "nlookahead", "std::size_t", "1",
                         "The number of lookahead steps.">,
@@ -157,7 +167,17 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
                         "The number of (possibly parallel) random trials of "
                         "the forwards and backwards mechanism. Must be > 0.">,
                  Option<"seed", "seed", "std::size_t", "42",
-                        "A seed used for randomization.">];
+                        "A seed used for randomization.">,
+                 Option<"qubitTypeLabels", "qubit-type-labels", "std::string",
+                        "\"\"",
+                        "Opt-in per-program-qubit A/B type labels for the "
+                        "stateful swap heuristic, e.g. 'AABB' labels program "
+                        "qubits 0 and 1 as A (auxiliary) and qubits 2 and 3 "
+                        "as B (data). Unlabeled trailing qubits default to "
+                        "B. When non-empty, SWAP costs become "
+                        "type-dependent (A<>A = 1, A<>B = 2, B<>B = 3) "
+                        "instead of a flat per-SWAP cost. Empty (the "
+                        "default) disables the heuristic.">];
   let statistics = [Statistic<"numSwaps", "num-inserted-swaps",
                               "The number of inserted SWAPs">];
 }

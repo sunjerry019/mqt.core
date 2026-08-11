@@ -46,6 +46,7 @@
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 #include <mlir/Transforms/Passes.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -1379,7 +1380,8 @@ TEST_P(MappingPassTest, MapBranchingGHZ) {
         return argQs;
       },
       [&](ValueRange args) {
-        SmallVector<Value> argQs(llvm::reverse(args));
+        SmallVector<Value> argQs(args);
+        std::reverse(argQs.begin(), argQs.end());
         flatGHZ(builder, argQs);
         return argQs;
       });
@@ -1631,5 +1633,289 @@ INSTANTIATE_TEST_SUITE_P(ThreeByThreeSquareGrid, MappingPassTest,
                          testing::Values(getSquareGridTarget(3)));
 INSTANTIATE_TEST_SUITE_P(FourByFourSquareGrid, MappingPassTest,
                          testing::Values(getSquareGridTarget(4)));
+/// Return the number of two-qubit, non-SWAP unitary operations that precede
+/// the first `qco.swap` operation in program order (or the total number of
+/// such operations if the program contains no SWAP).
+static size_t countTwoQubitGatesBeforeFirstSwap(func::FuncOp entry) {
+  size_t count = 0;
+  entry.walk([&](Operation* op) {
+    if (isa<SWAPOp>(op)) {
+      return WalkResult::interrupt();
+    }
+    if (auto unitaryOp = dyn_cast<UnitaryOpInterface>(op);
+        unitaryOp && !isa<BarrierOp>(op) && unitaryOp.getNumQubits() == 2) {
+      ++count;
+    }
+    return WalkResult::advance();
+  });
+  return count;
+}
+
+TEST_F(MappingPassFixture, StatefulSwapLabelsChangeRoutingChoice) {
+  // A 3-node path target: any placement of 3 mutually-interacting program
+  // qubits leaves exactly one pair non-adjacent (the two path endpoints), so
+  // routing the third (triangle-closing) CX always needs exactly one SWAP,
+  // regardless of the initial layout.
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    std::tie(qubits[1], qubits[2]) = builder.cx(qubits[1], qubits[2]);
+    std::tie(qubits[0], qubits[2]) = builder.cx(qubits[0], qubits[2]);
+
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+
+    return builder.finalize(bits);
+  };
+
+  // The `qubit-type-labels` option also feeds the initial-layout refinement
+  // (`generateLayout`), not just the final routing pass, so two different
+  // label strings can lead the pass to pick different initial layouts for
+  // the same program, target, and seed. With labels "AAA", the pass places
+  // program qubits 0 and 1 adjacently from the start, so both the first and
+  // second CX execute before the (unavoidable) SWAP. With labels "ABB", only
+  // the first CX executes before the SWAP is needed. This was confirmed
+  // empirically by walking the routed IR for both label strings at this seed.
+  auto moduleA = makeModule();
+  ASSERT_TRUE(runPass(moduleA.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .qubitTypeLabels = "AAA"})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleA)));
+  EXPECT_TRUE(isExecutable(getEntryPoint(moduleA.get()), target));
+
+  auto moduleB = makeModule();
+  ASSERT_TRUE(runPass(moduleB.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .qubitTypeLabels = "ABB"})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleB)));
+  EXPECT_TRUE(isExecutable(getEntryPoint(moduleB.get()), target));
+
+  // Both programs need exactly one SWAP (the triangle forces it), but the
+  // two label assignments make the pass insert it at a different point.
+  size_t numSwapsA = 0;
+  moduleA->walk([&](SWAPOp) { ++numSwapsA; });
+  size_t numSwapsB = 0;
+  moduleB->walk([&](SWAPOp) { ++numSwapsB; });
+  EXPECT_EQ(numSwapsA, 1UL);
+  EXPECT_EQ(numSwapsB, 1UL);
+
+  const auto gatesBeforeSwapA =
+      countTwoQubitGatesBeforeFirstSwap(getEntryPoint(moduleA.get()));
+  const auto gatesBeforeSwapB =
+      countTwoQubitGatesBeforeFirstSwap(getEntryPoint(moduleB.get()));
+  EXPECT_EQ(gatesBeforeSwapA, 2UL);
+  EXPECT_EQ(gatesBeforeSwapB, 1UL);
+  EXPECT_NE(gatesBeforeSwapA, gatesBeforeSwapB);
+}
+
+/// Return the qubit value that `v` was produced from, one step back along its
+/// linear def-use chain. For a `qco.swap` output, this correctly follows the
+/// crossover (the value continuing program identity through
+/// `qubit0_out`/`qubit1_out` originates from the *other* SWAP input,
+/// `qubit1_in`/`qubit0_in`, respectively) rather than the same-index input.
+static Value predecessorQubit(Value v) {
+  Operation* def = v.getDefiningOp();
+  if (auto swapOp = dyn_cast<SWAPOp>(def)) {
+    return v == swapOp.getQubit0Out() ? swapOp.getQubit1In()
+                                      : swapOp.getQubit0In();
+  }
+  auto unitaryOp = cast<UnitaryOpInterface>(def);
+  for (const auto [in, out] : llvm::zip_equal(unitaryOp.getInputQubits(),
+                                              unitaryOp.getOutputQubits())) {
+    if (out == v) {
+      return in;
+    }
+  }
+  llvm::reportFatalInternalError("no predecessor found for qubit value");
+}
+
+/// Return a map from every qubit `Value` in `entry` to the program-qubit
+/// index (matching the original allocation order) whose linear identity it
+/// carries. Ground truth is anchored at `entry`'s `func.return`: routing
+/// never touches classical (measurement result) values, so the i-th returned
+/// value is exactly the i-th program qubit's measurement result, in the
+/// original program order. From each such measurement, this first walks
+/// backward through `predecessorQubit` (which correctly follows the SWAP
+/// crossover) up to the originating `qco.static`, tagging every value on
+/// that pre-measurement chain. A measured qubit's *output* wire (QCO's
+/// linear semantics keep it live) still belongs to the same program even
+/// after measurement, and routing may reuse it further (e.g. as a SWAP
+/// operand) before finally sinking it; a second, forward pass over the
+/// function propagates every already-known tag through such later,
+/// post-measurement uses.
+static DenseMap<Value, size_t> traceProgramIdentities(func::FuncOp entry) {
+  DenseMap<Value, size_t> progOf;
+
+  auto returnOp =
+      cast<func::ReturnOp>(entry.getFunctionBody().front().getTerminator());
+  for (const auto [prog, bit] : llvm::enumerate(returnOp.getOperands())) {
+    auto measureOp = cast<MeasureOp>(bit.getDefiningOp());
+    for (Value qubit = measureOp.getQubitIn();;
+         qubit = predecessorQubit(qubit)) {
+      progOf[qubit] = prog;
+      if (isa<StaticOp>(qubit.getDefiningOp())) {
+        break;
+      }
+    }
+  }
+
+  for (Operation& op : entry.getFunctionBody().front()) {
+    if (auto swapOp = dyn_cast<SWAPOp>(op)) {
+      if (const auto it = progOf.find(swapOp.getQubit0In());
+          it != progOf.end()) {
+        progOf[swapOp.getQubit1Out()] = it->second;
+      }
+      if (const auto it = progOf.find(swapOp.getQubit1In());
+          it != progOf.end()) {
+        progOf[swapOp.getQubit0Out()] = it->second;
+      }
+      continue;
+    }
+    if (auto measureOp = dyn_cast<MeasureOp>(op)) {
+      if (const auto it = progOf.find(measureOp.getQubitIn());
+          it != progOf.end()) {
+        progOf[measureOp.getQubitOut()] = it->second;
+      }
+      continue;
+    }
+    auto unitaryOp = dyn_cast<UnitaryOpInterface>(op);
+    if (!unitaryOp) {
+      continue;
+    }
+    for (const auto [in, out] : llvm::zip_equal(unitaryOp.getInputQubits(),
+                                                unitaryOp.getOutputQubits())) {
+      if (const auto it = progOf.find(in); it != progOf.end()) {
+        progOf[out] = it->second;
+      }
+    }
+  }
+
+  return progOf;
+}
+
+TEST_F(MappingPassFixture, StatefulSwapLabelsPreferCheaperTypedSwap) {
+  // Same triangle scenario as `StatefulSwapLabelsChangeRoutingChoice`: a
+  // 3-node path target routing CX(q0,q1), CX(q1,q2), CX(q0,q2). At seed 1,
+  // routing needs exactly one SWAP, and (at the point it is inserted) two
+  // candidate SWAPs tie under the plain graph-distance heuristic. The
+  // stateful A/B cost model (A<>A=1, A<>B=2, B<>B=3) must break that tie in
+  // favor of the cheaper option. Two complementary label assignments prove
+  // this is genuinely cost-driven, not a coincidence of this seed/topology:
+  // with two "A"s and one "B", the cheap A<>A pair must be chosen over any
+  // pair touching the lone "B"; with one "A" and two "B"s, a SWAP touching
+  // the lone "A" (cost 2) must be chosen over the B<>B pair (cost 3).
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    std::tie(qubits[1], qubits[2]) = builder.cx(qubits[1], qubits[2]);
+    std::tie(qubits[0], qubits[2]) = builder.cx(qubits[0], qubits[2]);
+
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+
+    return builder.finalize(bits);
+  };
+
+  // Run the pass with `labels` and return the program-qubit indices (in the
+  // original allocation order) that the single inserted SWAP exchanges.
+  const auto swappedPrograms =
+      [&](const std::string& labels) -> std::pair<size_t, size_t> {
+    auto m = makeModule();
+    EXPECT_TRUE(runPass(m.get(), target,
+                        MappingPassOptions{.niterations = 1,
+                                           .ntrials = 1,
+                                           .seed = 1,
+                                           .qubitTypeLabels = labels})
+                    .succeeded());
+    EXPECT_TRUE(succeeded(verify(*m)));
+    EXPECT_TRUE(isExecutable(getEntryPoint(m.get()), target));
+
+    size_t numSwaps = 0;
+    SWAPOp theSwap;
+    m->walk([&](SWAPOp op) {
+      ++numSwaps;
+      theSwap = op;
+    });
+    EXPECT_EQ(numSwaps, 1UL);
+
+    const auto progOf = traceProgramIdentities(getEntryPoint(m.get()));
+    return {progOf.at(theSwap.getQubit0In()), progOf.at(theSwap.getQubit1In())};
+  };
+
+  // "ABB": q0 is the sole "A". The SWAP must involve it (the cheaper A<>B
+  // option, cost 2), not be the same-cost-3 SWAP between q1 and q2 (both
+  // "B").
+  const auto [abbP0, abbP1] = swappedPrograms("ABB");
+  EXPECT_TRUE(abbP0 == 0 || abbP1 == 0)
+      << "expected the SWAP to involve program qubit 0 (label 'A'), but it "
+         "exchanged program qubits "
+      << abbP0 << " and " << abbP1;
+
+  // "BAA": q0 is the sole "B". The cheapest option is the A<>A SWAP between
+  // q1 and q2 (cost 1); the SWAP must not touch q0 (any SWAP touching it
+  // costs at least 2).
+  const auto [baaP0, baaP1] = swappedPrograms("BAA");
+  EXPECT_TRUE(baaP0 != 0 && baaP1 != 0)
+      << "expected the SWAP to involve only program qubits 1 and 2 (label "
+         "'A'), but it exchanged program qubits "
+      << baaP0 << " and " << baaP1;
+}
+
+TEST_F(MappingPassFixture, InvalidQubitTypeLabelsFailsThePass) {
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  QCOProgramBuilder builder(context.get());
+  builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+  SmallVector<Value> qubits(3);
+  SmallVector<Value> bits(3);
+  for (size_t i = 0; i < qubits.size(); ++i) {
+    qubits[i] = builder.allocQubit();
+  }
+  std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+  for (size_t i = 0; i < qubits.size(); ++i) {
+    std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+    builder.sink(qubits[i]);
+  }
+
+  auto m = builder.finalize(bits);
+  EXPECT_TRUE(failed(
+      runPass(m.get(), target,
+              MappingPassOptions{.ntrials = 1, .qubitTypeLabels = "AXB"})));
+}
+
 INSTANTIATE_TEST_SUITE_P(TenByTenSquareGrid, MappingPassTest,
                          testing::Values(getSquareGridTarget(10)));

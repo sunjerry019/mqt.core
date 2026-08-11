@@ -83,6 +83,11 @@ private:
 
   enum class RoutingMode : bool { Cold, Hot };
 
+  /// The opt-in type label of a program qubit for the stateful swap
+  /// heuristic. Conventionally, `Auxiliary` marks an auxiliary qubit and
+  /// `Data` marks a data qubit.
+  enum class QubitLabel : uint8_t { Auxiliary = 0, Data = 1 };
+
   struct WireInfos {
     /// Return the mapped wire index of a program index.
     [[nodiscard]] size_t lookupIndex(const size_t prog) const {
@@ -177,19 +182,35 @@ private:
     IndexPairType swap;
     Node* parent;
     size_t depth;
+    /// Sum of the type-dependent costs of the SWAPs on the path from the
+    /// root to this node. Only meaningful if `useTypedCost` is set.
+    float pathCost;
+    /// Whether the stateful A/B swap heuristic is opted into for this
+    /// search. Copied down from the root node.
+    bool useTypedCost;
     float f;
 
     /// Construct a root node with the given layout. Initialize the
     /// sequence with an empty vector and set the cost to zero.
-    explicit Node(Layout layout)
-        : layout(std::move(layout)), parent(nullptr), depth(0), f(0) {}
+    Node(Layout layout, const bool useTypedCost)
+        : layout(std::move(layout)), parent(nullptr), depth(0), pathCost(0),
+          useTypedCost(useTypedCost), f(0) {}
 
     /// Construct a non-root node from its parent node. Apply the given swap to
-    /// the layout of the parent node.
+    /// the layout of the parent node. If the stateful A/B swap heuristic is
+    /// enabled, `qubitLabels` (indexed by program qubit) determines the
+    /// type-dependent cost contributed by this SWAP.
     Node(Node* parent, const IndexPairType& swap, const Window& window,
-         const CompilerTarget& target, const Parameters& params)
+         const CompilerTarget& target, const Parameters& params,
+         ArrayRef<QubitLabel> qubitLabels)
         : layout(parent->layout), swap(swap), parent(parent),
-          depth(parent->depth + 1), f(0) {
+          depth(parent->depth + 1), pathCost(parent->pathCost),
+          useTypedCost(parent->useTypedCost), f(0) {
+      if (useTypedCost) {
+        const auto [prog0, prog1] =
+            layout.getProgramIndices(swap.first, swap.second);
+        pathCost += typedSwapCost(qubitLabels[prog0], qubitLabels[prog1]);
+      }
       layout.swap(swap.first, swap.second);
       f = g(params.alpha) + h(window, target, params); // NOLINT
     }
@@ -206,8 +227,20 @@ private:
   private:
     /// Calculate the path cost for the A* search algorithm.
     /// The path costs are the weighted sum of the currently required SWAPs.
+    /// If the stateful A/B swap heuristic is enabled, the flat per-SWAP cost
+    /// is replaced by the type-dependent cost accumulated in `pathCost`.
     [[nodiscard]] float g(const float alpha) const {
-      return alpha * static_cast<float>(depth);
+      return alpha * (useTypedCost ? pathCost : static_cast<float>(depth));
+    }
+
+    /// Return the type-dependent cost of a SWAP between two program qubits
+    /// with the given labels: A<>A = 1, A<>B = 2, B<>B = 3.
+    [[nodiscard]] static float typedSwapCost(const QubitLabel lhs,
+                                             const QubitLabel rhs) {
+      if (lhs != rhs) {
+        return 2.0F;
+      }
+      return lhs == QubitLabel::Auxiliary ? 1.0F : 3.0F;
     }
 
     /// Calculate the heuristic cost for the A* search algorithm.
@@ -338,6 +371,18 @@ protected:
       return;
     }
 
+    auto parsedLabels =
+        parseQubitLabels(qubitTypeLabels.getValue(), target->numQubits());
+    if (failed(parsedLabels)) {
+      func.emitError() << "invalid qubit-type-labels option '"
+                       << qubitTypeLabels.getValue()
+                       << "': expected only 'A'/'a'/'0' or 'B'/'b'/'1' "
+                          "characters";
+      signalPassFailure();
+      return;
+    }
+    qubitLabels = std::move(*parsedLabels);
+
     auto comp = discoverComputation(func);
     if (failed(comp)) {
       signalPassFailure();
@@ -387,6 +432,38 @@ protected:
   }
 
 private:
+  /// Parse the `qubitTypeLabels` option into a dense per-program-qubit
+  /// vector of `QubitLabel`s, opting into the stateful A/B swap heuristic.
+  /// Each character of `spec` must be one of 'A'/'a'/'0' (Auxiliary) or
+  /// 'B'/'b'/'1' (Data); qubits beyond the end of `spec` default to Data.
+  /// Returns failure if `spec` contains any other character. Returns an
+  /// empty vector (disabling the heuristic) if `spec` is empty.
+  [[nodiscard]] static FailureOr<SmallVector<QubitLabel>>
+  parseQubitLabels(StringRef spec, const size_t nqubits) {
+    if (spec.empty()) {
+      return SmallVector<QubitLabel>{};
+    }
+
+    SmallVector<QubitLabel> labels(nqubits, QubitLabel::Data);
+    for (size_t i = 0; i < std::min(spec.size(), labels.size()); ++i) {
+      switch (spec[i]) {
+      case 'A':
+      case 'a':
+      case '0':
+        labels[i] = QubitLabel::Auxiliary;
+        break;
+      case 'B':
+      case 'b':
+      case '1':
+        labels[i] = QubitLabel::Data;
+        break;
+      default:
+        return failure();
+      }
+    }
+    return labels;
+  }
+
   /// Return the qubit values in `values`, preserving their relative order.
   static SmallVector<Value> getQubitValues(ValueRange values) {
     return to_vector(llvm::make_filter_range(
@@ -905,7 +982,8 @@ private:
         frontier;
 
     // Early exit, if the root node is a goal node already.
-    Node* root = std::construct_at(arena.Allocate(), layout);
+    Node* root =
+        std::construct_at(arena.Allocate(), layout, !qubitLabels.empty());
     if (root->isGoal(window.front(), *target)) {
       return SmallVector<IndexPairType>{};
     }
@@ -966,7 +1044,8 @@ private:
           expansionSet.push_back(swap);
 
           frontier.emplace(std::construct_at(arena.Allocate(), curr, swap,
-                                             window, *target, params));
+                                             window, *target, params,
+                                             ArrayRef(qubitLabels)));
         });
       }
 
@@ -1620,6 +1699,11 @@ private:
   }
 
   std::optional<CompilerTarget> target;
+
+  /// Per-program-qubit A/B type labels for the opt-in stateful swap
+  /// heuristic, parsed from `qubitTypeLabels` at the start of
+  /// `runOnOperation`. Empty when the heuristic is disabled.
+  SmallVector<QubitLabel> qubitLabels;
 };
 
 } // namespace

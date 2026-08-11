@@ -12,6 +12,10 @@ releases may include breaking changes.
 
 ### Added
 
+- ✨ Add an opt-in stateful A/B swap heuristic to the MLIR mapping pass, letting
+  a `qubit-type-labels` option assign auxiliary/data roles to program qubits
+  that make SWAP costs type-dependent (A<>A=1, A<>B=2, B<>B=3) during routing
+  ([#????]) ([**@sunjerry019**])
 - ✨ Support retrieving existing jobs by ID through the QDMI client API and
   expose optional device queue length and job queue position through the C++ and
   Python FoMaC APIs ([#2010]) ([**@burgholzer**])
@@ -725,6 +729,7 @@ for previous changelogs._
 
 <!-- PR links -->
 
+[#????]: https://github.com/munich-quantum-toolkit/core/pull/????
 [#2028]: https://github.com/munich-quantum-toolkit/core/pull/2028
 [#2026]: https://github.com/munich-quantum-toolkit/core/pull/2026
 [#2011]: https://github.com/munich-quantum-toolkit/core/pull/2011
@@ -1077,6 +1082,7 @@ for previous changelogs._
 [**@keefehuang**]: https://github.com/keefehuang
 [**@J4MMlE**]: https://github.com/J4MMlE
 [**@rturrado**]: https://github.com/rturrado
+[**@sunjerry019**]: https://github.com/sunjerry019
 
 <!-- General links -->
 
