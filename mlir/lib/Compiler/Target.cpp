@@ -680,15 +680,23 @@ bool CompilerTarget::supports(::mlir::Operation* operation) const {
       return true;
     }
     if (auto controlled = dyn_cast<qco::CtrlOp>(operation);
-        controlled && controlled.getNumControls() == 1 &&
-        controlled.getNumTargets() == 1 &&
+        controlled && controlled.getNumTargets() == 1 &&
         controlled.getNumBodyUnitaries() == 1) {
       auto* const body = controlled.getBodyUnitary(0).getOperation();
-      if (isa<qco::XOp>(body)) {
-        return storage_->supportsOperation("cx", 2, 0);
-      }
-      if (isa<qco::ZOp>(body)) {
-        return storage_->supportsOperation("cz", 2, 0);
+      if (controlled.getNumControls() == 1) {
+        if (isa<qco::XOp>(body)) {
+          return storage_->supportsOperation("cx", 2, 0);
+        }
+        if (isa<qco::ZOp>(body)) {
+          return storage_->supportsOperation("cz", 2, 0);
+        }
+      } else if (controlled.getNumControls() == 2) {
+        if (isa<qco::XOp>(body)) {
+          return storage_->supportsOperation("ccx", 3, 0);
+        }
+        if (isa<qco::ZOp>(body)) {
+          return storage_->supportsOperation("ccz", 3, 0);
+        }
       }
     }
     return storage_->supportsOperation(unitary.getBaseSymbol(),

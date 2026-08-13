@@ -107,7 +107,11 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
     qubits in a quantum program to the static sites of a `CompilerTarget`. It
     uses only the target's undirected coupling topology: arbitrary one-qubit
     operations pass through, and every two-qubit operation is routed to adjacent
-    target vertices. Higher-arity unitaries must be decomposed before mapping.
+    target vertices. A higher-arity unitary must be decomposed before mapping,
+    unless the target's explicitly declared `operations` capability list
+    includes it by exact name and qubit count (see the paragraph on native
+    multi-qubit gates below), in which case it is instead routed intact, onto
+    a set of mutually adjacent target vertices.
     Target-defined site identifiers are retained in the resulting
     `qco.static` operations.
 
@@ -153,6 +157,19 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
     is the sum of the type-dependent costs of the SWAPs on that path, instead of `alpha * depth(n)`. `h(n)` is
     unaffected. The heuristic is opt-in and disabled by default (`g(n) = alpha * depth(n)`, as above), preserving the
     default routing behavior.
+
+    The pass optionally routes a native multi-qubit gate (acting on more than two qubits, e.g. a doubly-controlled-Z
+    or a Toffoli/doubly-controlled-X built as a `qco.ctrl` with two controls) without requiring it to be decomposed
+    first, when the target's `CompilerTarget::operations` list explicitly declares that exact operation (matched by
+    name, e.g. `"ccz"`/`"ccx"`, and qubit count). In that case, the operation's qubits are treated as a group: the
+    A* search's goal and heuristic-cost checks require every pair of qubits within the group to be mutually adjacent
+    (a "clique"/triangle for a three-qubit gate) instead of a single pair, and SWAPs are still inserted, one pair of
+    hardware sites at a time, until that holds. A target that never explicitly declares `operations` (or that
+    declares one without the exact operation) keeps the pass's prior, unconditional behavior: any operation wider
+    than two qubits is rejected, and the caller must decompose it (e.g. with the `decompose-multi-controlled` pass)
+    first. This pass does not translate between different native multi-qubit gates of the same arity (for example,
+    rewriting a Toffoli into an equivalent Hadamard-conjugated doubly-controlled-Z when only the latter is declared
+    native); any such gate-basis translation must happen in an earlier pipeline stage.
   }];
   let options = [Option<"nlookahead", "nlookahead", "std::size_t", "1",
                         "The number of lookahead steps.">,

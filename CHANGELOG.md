@@ -12,6 +12,12 @@ releases may include breaking changes.
 
 ### Added
 
+- ✨ Route native multi-qubit gates (e.g. a target-declared CCZ or CCX) in the
+  MLIR mapping pass without requiring decomposition first, placing and
+  SWAP-routing them onto mutually adjacent target sites whenever the
+  `CompilerTarget` explicitly declares the operation; every target that does not
+  declare it keeps the pass's prior decomposition-required behavior ([#????])
+  ([**@sunjerry019**])
 - ✨ Add an opt-in stateful A/B swap heuristic to the MLIR mapping pass, letting
   a `qubit-type-labels` option assign auxiliary/data roles to program qubits
   that make SWAP costs type-dependent (A<>A=1, A<>B=2, B<>B=3) during routing

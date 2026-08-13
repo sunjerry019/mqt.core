@@ -76,7 +76,11 @@ namespace {
 struct MappingPass : impl::MappingPassBase<MappingPass> {
 private:
   using IndexPairType = std::pair<size_t, size_t>;
-  using Window = SmallVector<IndexPairType>;
+  /// A group of program indices that a single (possibly wider-than-two-qubit)
+  /// gate acts on. Sized inline for up to 3 elements as a performance hint;
+  /// it can hold more without any correctness change.
+  using IndexGroupType = SmallVector<size_t, 3>;
+  using Window = SmallVector<IndexGroupType>;
   using Wires = SmallVector<WireIterator>;
   using RecursiveRoutingStackItem = std::pair<Operation*, SmallVector<size_t>>;
   using RecursiveRoutingStack = SmallVector<RecursiveRoutingStackItem>;
@@ -216,12 +220,21 @@ private:
     }
 
     /// Return true, if the current SWAP sequence makes all gates in the front
-    /// executable.
-    [[nodiscard]] bool isGoal(const IndexPairType& front,
+    /// executable, i.e. every pair of program qubits in `front` maps to
+    /// mutually adjacent hardware sites (a single pair for a two-qubit gate;
+    /// a "clique"/triangle check for a wider native gate). For a two-element
+    /// `front`, this is exactly the original single-pair check.
+    [[nodiscard]] bool isGoal(const IndexGroupType& front,
                               const CompilerTarget& target) const {
-      const auto [hw0, hw1] =
-          layout.getHardwareIndices(front.first, front.second);
-      return target.areAdjacent(hw0, hw1);
+      for (size_t i = 0; i < front.size(); ++i) {
+        for (size_t j = i + 1; j < front.size(); ++j) {
+          const auto [hwI, hwJ] = layout.getHardwareIndices(front[i], front[j]);
+          if (!target.areAdjacent(hwI, hwJ)) {
+            return false;
+          }
+        }
+      }
+      return true;
     }
 
   private:
@@ -246,20 +259,27 @@ private:
     /// Calculate the heuristic cost for the A* search algorithm.
     ///
     /// Computes the minimal number of SWAPs required to route each gate in
-    /// each layer. For each gate, this is determined by the shortest distance
-    /// between its hardware qubits. Intuitively, this is the number of SWAPs
-    /// that a naive router would insert to route the layers (with a constant
-    /// layout).
+    /// each layer. For each gate, this is determined by the sum, over every
+    /// pair of program qubits the gate acts on, of the shortest distance
+    /// between their hardware qubits (a single term for a two-qubit gate).
+    /// Intuitively, this is the number of SWAPs that a naive router would
+    /// insert to route the layers (with a constant layout).
     [[nodiscard]] float h(const Window& window, const CompilerTarget& target,
                           const Parameters& params) const {
       float costs{0};
       float decay{1.};
 
-      for (const auto& [i, progs] : enumerate(window)) {
-        const auto [prog0, prog1] = progs;
-        const auto [hw0, hw1] = layout.getHardwareIndices(prog0, prog1);
-        const size_t nswaps = target.distanceBetween(hw0, hw1) - 1;
-        costs += decay * static_cast<float>(nswaps);
+      for (const IndexGroupType& group : window) {
+        float groupCost{0};
+        for (size_t i = 0; i < group.size(); ++i) {
+          for (size_t j = i + 1; j < group.size(); ++j) {
+            const auto [hwI, hwJ] =
+                layout.getHardwareIndices(group[i], group[j]);
+            const size_t nswaps = target.distanceBetween(hwI, hwJ) - 1;
+            groupCost += static_cast<float>(nswaps);
+          }
+        }
+        costs += decay * groupCost;
         decay *= params.lambda;
       }
       return costs;
@@ -602,6 +622,30 @@ private:
     return newWhileOp;
   }
 
+  /// Return whether a wider-than-two-qubit operation may be routed as an
+  /// atomic native gate, without requiring decomposition first.
+  ///
+  /// This is the single, isolated place this pass decides that policy: every
+  /// other part of the router (the `Window`/`Node`/`getWindow`/`advance`/
+  /// `search` machinery) only ever asks whether an operation's qubits can be
+  /// placed on mutually adjacent hardware sites, never why. Today this
+  /// requires an exact name-and-arity match against the target's explicitly
+  /// declared native operations (see `CompilerTarget::supports`), mirroring
+  /// how `CompilerTarget::supports` already recognizes e.g. a two-control
+  /// `qco.ctrl(qco.x)`/`qco.ctrl(qco.z)` as `"ccx"`/`"ccz"`. A target that
+  /// never explicitly declares its `operations` (i.e.
+  /// `hasExplicitOperations()` is false) is intentionally excluded even
+  /// though `CompilerTarget::supportsOperation` would otherwise report every
+  /// operation as supported by default: this keeps every target that omits
+  /// `operations` on the pass's prior, unconditional decomposition-required
+  /// behavior. A future change could instead make this arity- and
+  /// connectivity-only (routable whenever the target declares *some* native
+  /// operation at this arity, regardless of which one) by editing only this
+  /// function.
+  [[nodiscard]] bool isNativelyRoutable(Operation* op) const {
+    return target->hasExplicitOperations() && target->supports(op);
+  }
+
   /// Return the wires of a dynamic computation.
   /// Scalar `qco.alloc` operations define program qubits directly. For
   /// `qtensor` allocations, the mapping pass assumes an extraction and
@@ -617,7 +661,7 @@ private:
   ///
   /// If any of the above assumptions are violated, the function returns
   /// failure.
-  static FailureOr<Computation> discoverComputation(func::FuncOp func) {
+  FailureOr<Computation> discoverComputation(func::FuncOp func) {
     Computation computation;
 
     const auto discovery = func.walk([&](Operation* op) {
@@ -625,7 +669,7 @@ private:
         if (isa<BarrierOp>(op)) {
           return WalkResult::advance();
         }
-        if (unitary.getNumQubits() > 2) {
+        if (unitary.getNumQubits() > 2 && !isNativelyRoutable(op)) {
           unitary.emitError()
               << "cannot route an operation acting on "
               << unitary.getNumQubits()
@@ -1033,7 +1077,7 @@ private:
       // between two neighboring hardware qubits.
 
       expansionSet.clear();
-      for (const auto& [q0, q1] = window.front(); const auto prog : {q0, q1}) {
+      for (const auto prog : window.front()) {
         const auto hw0 = curr->layout.getHardwareIndex(prog);
         target->forEachNeighbour(hw0, [&](const auto hw1) {
           // Ensure consistent hashing/comparison.
@@ -1171,17 +1215,19 @@ private:
     return Layout::fromMapping(mapping);
   }
 
-  /// Skip to the end of the two-qubit block for both wire iterators, where
-  /// initially both must point at the same two-qubit operation.
+  /// Skip to the end of the qubit-group block for every wire iterator in
+  /// `its`, where initially every iterator must point at the same
+  /// multi-qubit operation (a single pair for a two-qubit gate; a wider
+  /// group for a native gate acting on more qubits).
   template <WireDirection Direction>
-  static void skipQubitPairBlock(WireIterator& it0, WireIterator& it1) {
+  static void skipQubitGroupBlock(MutableArrayRef<WireIterator> its) {
     using Traits = WireTraversalTraits<Direction>;
 
-    // Traverses the pair of wire iterators in tandem until a two-qubit
-    // operation is found. If the two-qubit operation is equivalent, continue.
-    // Otherwise, stop.
+    // Traverses the group of wire iterators in tandem until a matching
+    // multi-qubit operation is found on every one of them. If they are all
+    // equivalent, continue. Otherwise, stop.
 
-    std::array block{it0, it1};
+    SmallVector<WireIterator, 3> block(its.begin(), its.end());
     while (true) {
       for (auto& it : block) {
         while (Traits::isActive(it)) {
@@ -1193,11 +1239,11 @@ private:
 
           if (auto u = dyn_cast<UnitaryOpInterface>(it.operation());
               u && u.getNumQubits() > 1) {
-            // Handle two-qubit barrier edge case explicitly.
-            if (isa<BarrierOp>(u) && u.getNumQubits() != 2) {
+            // Handle the same-width barrier edge case explicitly.
+            if (isa<BarrierOp>(u) && u.getNumQubits() != block.size()) {
               return;
             }
-            // Otherwise stop for subsequent two-qubit unitary comparison.
+            // Otherwise stop for subsequent group-unitary comparison.
             break;
           }
         }
@@ -1207,12 +1253,13 @@ private:
         }
       }
 
-      if (block[0].operation() != block[1].operation()) {
+      if (llvm::any_of(block, [&](const WireIterator& it) {
+            return it.operation() != block.front().operation();
+          })) {
         return;
       }
 
-      it0 = block[0];
-      it1 = block[1];
+      llvm::copy(block, its.begin());
     }
   }
 
@@ -1230,17 +1277,27 @@ private:
 
           for (const auto& [op, indices] : ready) {
             if (isa<UnitaryOpInterface>(op)) {
-              const auto i0 = indices[0];
-              const auto i1 = indices[1];
-              const auto prog0 = infos.lookupProgram(i0);
-              const auto prog1 = infos.lookupProgram(i1);
+              IndexGroupType group;
+              group.reserve(indices.size());
+              for (const size_t idx : indices) {
+                group.push_back(infos.lookupProgram(idx));
+              }
 
-              window.emplace_back(prog0, prog1);
+              window.emplace_back(std::move(group));
               if (window.size() == 1 + nlookahead) {
                 return WalkResult::interrupt();
               }
 
-              skipQubitPairBlock<Direction>(wires[i0], wires[i1]);
+              SmallVector<WireIterator, 3> groupWires;
+              groupWires.reserve(indices.size());
+              for (const size_t idx : indices) {
+                groupWires.push_back(wires[idx]);
+              }
+              skipQubitGroupBlock<Direction>(groupWires);
+              for (size_t pos = 0; pos < indices.size(); ++pos) {
+                wires[indices[pos]] = groupWires[pos];
+              }
+
               released.emplace_back(op);
               return WalkResult::advance();
             }
@@ -1325,10 +1382,23 @@ private:
         }
 
         if (isa<UnitaryOpInterface>(op)) {
-          const auto prog0 = infos.lookupProgram(indices[0]);
-          const auto prog1 = infos.lookupProgram(indices[1]);
-          if (const auto [hw0, hw1] = layout.getHardwareIndices(prog0, prog1);
-              target->areAdjacent(hw0, hw1)) {
+          SmallVector<size_t, 3> hws;
+          hws.reserve(indices.size());
+          for (const size_t idx : indices) {
+            hws.push_back(layout.getHardwareIndex(infos.lookupProgram(idx)));
+          }
+
+          bool executable = true;
+          for (size_t i = 0; executable && i < hws.size(); ++i) {
+            for (size_t j = i + 1; j < hws.size(); ++j) {
+              if (!target->areAdjacent(hws[i], hws[j])) {
+                executable = false;
+                break;
+              }
+            }
+          }
+
+          if (executable) {
             released.emplace_back(op);
           }
           continue;

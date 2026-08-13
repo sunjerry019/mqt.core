@@ -1917,5 +1917,249 @@ TEST_F(MappingPassFixture, InvalidQubitTypeLabelsFailsThePass) {
               MappingPassOptions{.ntrials = 1, .qubitTypeLabels = "AXB"})));
 }
 
+/// Return the physical sites of every native multi-qubit `CtrlOp` remaining
+/// in `m`'s entry point, in program order, by tracking each qubit's site as
+/// it flows forward through
+/// `StaticOp`/`UnitaryOpInterface`/`ResetOp`/`MeasureOp` operations. A
+/// `SWAPOp`'s outputs keep the same site as their correspondingly indexed
+/// inputs (no crossover for *site*, as opposed to program-identity,
+/// tracking), so it needs no special case here: it is handled by the
+/// generic `UnitaryOpInterface` branch below.
+static SmallVector<SmallVector<CompilerTarget::SiteId>>
+getCtrlOpsSites(ModuleOp m) {
+  DenseMap<Value, CompilerTarget::SiteId> siteOf;
+  SmallVector<CtrlOp> ctrls;
+  // Iterate only the entry block's top-level operations (not `walk`, which
+  // would also recurse into `CtrlOp`'s own nested body region and its
+  // block-argument-aliased qubits, which are not tracked here).
+  for (Operation& opRef : getEntryPoint(m).getFunctionBody().front()) {
+    Operation* op = &opRef;
+    if (auto staticOp = dyn_cast<StaticOp>(op)) {
+      siteOf.try_emplace(staticOp.getQubit(), staticOp.getIndex());
+      continue;
+    }
+    if (auto unitaryOp = dyn_cast<UnitaryOpInterface>(op)) {
+      for (const auto [pred, succ] : llvm::zip_equal(
+               unitaryOp.getInputQubits(), unitaryOp.getOutputQubits())) {
+        siteOf.try_emplace(succ, siteOf.at(pred));
+      }
+      if (auto c = dyn_cast<CtrlOp>(op)) {
+        ctrls.push_back(c);
+      }
+      continue;
+    }
+    if (auto resetOp = dyn_cast<ResetOp>(op)) {
+      siteOf.try_emplace(resetOp.getQubitOut(),
+                         siteOf.at(resetOp.getQubitIn()));
+      continue;
+    }
+    if (auto measOp = dyn_cast<MeasureOp>(op)) {
+      siteOf.try_emplace(measOp.getQubitOut(), siteOf.at(measOp.getQubitIn()));
+    }
+  }
+
+  SmallVector<SmallVector<CompilerTarget::SiteId>> result;
+  for (CtrlOp ctrl : ctrls) {
+    SmallVector<CompilerTarget::SiteId> sites;
+    for (const Value q : ctrl.getInputQubits()) {
+      sites.push_back(siteOf.at(q));
+    }
+    result.push_back(std::move(sites));
+  }
+  return result;
+}
+
+/// Assert that every pair of sites in `sites` is mutually adjacent on
+/// `target` (a "clique"/triangle check for three sites).
+static void expectMutuallyAdjacent(ArrayRef<CompilerTarget::SiteId> sites,
+                                   const CompilerTarget& target) {
+  for (size_t i = 0; i < sites.size(); ++i) {
+    for (size_t j = i + 1; j < sites.size(); ++j) {
+      const auto vi = target.vertexForSite(sites[i]);
+      const auto vj = target.vertexForSite(sites[j]);
+      ASSERT_TRUE(vi.has_value() && vj.has_value());
+      EXPECT_TRUE(target.areAdjacent(*vi, *vj))
+          << "sites " << sites[i] << " and " << sites[j]
+          << " are not mutually adjacent";
+    }
+  }
+}
+
+/// Build a 3-qubit program consisting of a single native CCX gate
+/// (`builder.mcx`, two controls and one target) on freshly allocated
+/// qubits, then measure and sink all three.
+static OwningOpRef<ModuleOp> buildSingleNativeCCXProgram(MLIRContext* ctx) {
+  QCOProgramBuilder builder(ctx);
+  builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+  SmallVector<Value> qubits(3);
+  SmallVector<Value> bits(3);
+  for (size_t i = 0; i < qubits.size(); ++i) {
+    qubits[i] = builder.allocQubit();
+  }
+
+  auto [controlsOut, targetOut] =
+      builder.mcx({qubits[0], qubits[1]}, qubits[2]);
+  qubits[0] = controlsOut[0];
+  qubits[1] = controlsOut[1];
+  qubits[2] = targetOut;
+
+  for (size_t i = 0; i < qubits.size(); ++i) {
+    std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+    builder.sink(qubits[i]);
+  }
+
+  return builder.finalize(bits);
+}
+
+/// Build a 4-qubit program consisting of two sequential native CCX gates
+/// that share the same two controls (`q0`, `q1`) but target different third
+/// qubits (`q2`, then `q3`). No single static layout can satisfy both gates
+/// on a target with only one triangle sized to fit exactly three of the
+/// four qubits at once: after the first gate, the triangle's third slot
+/// (currently holding `q2`) must be vacated for `q3`, forcing a genuine
+/// SWAP that a starting-layout refinement alone cannot eliminate.
+static OwningOpRef<ModuleOp>
+buildTwoSequentialNativeCCXProgram(MLIRContext* ctx) {
+  QCOProgramBuilder builder(ctx);
+  builder.initialize(SmallVector<Type>(4, builder.getI1Type()));
+
+  SmallVector<Value> qubits(4);
+  SmallVector<Value> bits(4);
+  for (size_t i = 0; i < qubits.size(); ++i) {
+    qubits[i] = builder.allocQubit();
+  }
+
+  {
+    auto [controlsOut, targetOut] =
+        builder.mcx({qubits[0], qubits[1]}, qubits[2]);
+    qubits[0] = controlsOut[0];
+    qubits[1] = controlsOut[1];
+    qubits[2] = targetOut;
+  }
+  {
+    auto [controlsOut, targetOut] =
+        builder.mcx({qubits[0], qubits[1]}, qubits[3]);
+    qubits[0] = controlsOut[0];
+    qubits[1] = controlsOut[1];
+    qubits[3] = targetOut;
+  }
+
+  for (size_t i = 0; i < qubits.size(); ++i) {
+    std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+    builder.sink(qubits[i]);
+  }
+
+  return builder.finalize(bits);
+}
+
+TEST_F(MappingPassFixture,
+       NativeMultiQubitGateAcceptedUndecomposedWhenAlreadyOnATriangle) {
+  // A complete (triangle) 3-qubit target: every pair of sites is adjacent,
+  // so any placement of the CCX gate's three qubits already satisfies its
+  // mutual-adjacency requirement, and no SWAP should ever be necessary.
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}, {0, 2}},
+      std::vector<CompilerTarget::Operation>{
+          CompilerTarget::Operation("ccx", 3, 0)});
+
+  auto m = buildSingleNativeCCXProgram(context.get());
+  ASSERT_TRUE(succeeded(verify(*m)));
+  ASSERT_TRUE(
+      runPass(m.get(), target, MappingPassOptions{.ntrials = 1}).succeeded());
+  ASSERT_TRUE(succeeded(verify(*m)));
+
+  size_t numCtrlOps = 0;
+  m->walk([&](CtrlOp ctrl) {
+    ++numCtrlOps;
+    EXPECT_EQ(ctrl.getNumQubits(), 3U);
+  });
+  EXPECT_EQ(numCtrlOps, 1U)
+      << "expected the CCX gate to survive routing as a single, "
+         "undecomposed CtrlOp";
+
+  size_t numSwaps = 0;
+  m->walk([&](SWAPOp) { ++numSwaps; });
+  EXPECT_EQ(numSwaps, 0U)
+      << "expected no SWAPs on a fully-connected 3-qubit target";
+
+  const auto ctrlSites = getCtrlOpsSites(m.get());
+  ASSERT_EQ(ctrlSites.size(), 1U);
+  expectMutuallyAdjacent(ctrlSites[0], target);
+}
+
+TEST_F(MappingPassFixture,
+       NativeMultiQubitGateGetsRoutedOntoATriangleWithSwaps) {
+  // A 4-qubit target with exactly one triangle {0, 1, 2} (0<>1, 1<>2, 0<>2)
+  // plus a pendant site 3 attached only to site 2 (2<>3). The program
+  // (`buildTwoSequentialNativeCCXProgram`) has two sequential CCX gates
+  // sharing controls q0/q1 but targeting different third qubits q2 then q3.
+  // No single static layout can satisfy both: q0 and q1 must sit on two of
+  // the triangle's three sites (the only sites mutually adjacent to a third
+  // site at all), leaving only site 2 able to host a third mutually
+  // adjacent qubit at any one time — so after the first gate is executable
+  // with q2 on site 2, q3 (initially elsewhere) must be swapped into site 2
+  // (displacing q2) before the second gate is executable. This is a
+  // genuine circuit-level conflict a starting-layout refinement alone
+  // cannot eliminate, forcing at least one real SWAP.
+  const CompilerTarget target(
+      4, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}, {0, 2}, {2, 3}},
+      std::vector<CompilerTarget::Operation>{
+          CompilerTarget::Operation("ccx", 3, 0)});
+
+  auto m = buildTwoSequentialNativeCCXProgram(context.get());
+  ASSERT_TRUE(succeeded(verify(*m)));
+  ASSERT_TRUE(
+      runPass(m.get(), target, MappingPassOptions{.ntrials = 1}).succeeded());
+  ASSERT_TRUE(succeeded(verify(*m)));
+
+  size_t numCtrlOps = 0;
+  m->walk([&](CtrlOp ctrl) {
+    ++numCtrlOps;
+    EXPECT_EQ(ctrl.getNumQubits(), 3U);
+  });
+  EXPECT_EQ(numCtrlOps, 2U)
+      << "expected both CCX gates to survive routing as undecomposed "
+         "CtrlOps";
+
+  size_t numSwaps = 0;
+  m->walk([&](SWAPOp) { ++numSwaps; });
+  EXPECT_GT(numSwaps, 0U)
+      << "expected the pass to actively route the second CCX gate's "
+         "qubits onto the target's one triangle, not merely accept an "
+         "already-valid placement";
+
+  const auto ctrlSites = getCtrlOpsSites(m.get());
+  ASSERT_EQ(ctrlSites.size(), 2U);
+  expectMutuallyAdjacent(ctrlSites[0], target);
+  expectMutuallyAdjacent(ctrlSites[1], target);
+}
+
+TEST_F(MappingPassFixture,
+       NativeMultiQubitGateStillRequiresDecompositionWithoutTargetSupport) {
+  // Same topology and program as the "already on a triangle" test above,
+  // but the target's explicit (empty) operations list declares no native
+  // operations at all, so the pass must fall back to its prior behavior:
+  // reject the undecomposed CCX gate.
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}, {0, 2}},
+      std::vector<CompilerTarget::Operation>{});
+
+  auto m = buildSingleNativeCCXProgram(context.get());
+  ASSERT_TRUE(succeeded(verify(*m)));
+
+  std::string diagnostics;
+  ScopedDiagnosticHandler handler(context.get(), [&](Diagnostic& diagnostic) {
+    diagnostics += diagnostic.str();
+    return success();
+  });
+  EXPECT_TRUE(
+      failed(runPass(m.get(), target, MappingPassOptions{.ntrials = 1})));
+  EXPECT_TRUE(
+      StringRef(diagnostics)
+          .contains("decompose it to one- and two-qubit operations first"))
+      << diagnostics;
+}
+
 INSTANTIATE_TEST_SUITE_P(TenByTenSquareGrid, MappingPassTest,
                          testing::Values(getSquareGridTarget(10)));
