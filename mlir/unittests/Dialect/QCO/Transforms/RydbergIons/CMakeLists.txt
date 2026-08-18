@@ -6,8 +6,8 @@
 #
 # Licensed under the MIT License
 
-set(target_name mqt-core-mlir-unittest-mapping)
-add_executable(${target_name} test_mapping.cpp)
+set(target_name mqt-core-mlir-unittest-rydberg-ions)
+add_executable(${target_name} test_rydberg_ions.cpp)
 
 target_link_libraries(
   ${target_name}
@@ -17,6 +17,8 @@ target_link_libraries(
           MLIRQCOProgramBuilder
           MLIRQTensorUtils
           MLIRQCOTransforms
+          MLIRQCOToQC
+          MLIRQCOpenQASMTranslation
           MLIRSupportMQT)
 
 mqt_mlir_configure_unittest_target(${target_name})

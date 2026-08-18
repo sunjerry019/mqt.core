@@ -68,6 +68,17 @@ significant, unrelated finding this work surfaced (`MappingPass` routing is not
 actually run-to-run deterministic, even with a fixed seed) and Decision Log for
 why that finding is documented but not fixed here.
 
+**Addendum (2026-08-18):** at a further user follow-up request, this file was
+split into its own GoogleTest binary — it is no longer built into
+`mqt-core-mlir-unittest-mapping` — and the stdout dump was extended with a
+second representation of the routed circuit, portable OpenQASM3, specifically so
+it can be pasted into an external OpenQASM3-capable tool for visual inspection.
+Every fact in the paragraphs above about the file's *content* still holds; only
+its build location and the shape of its stdout output changed. See Progress,
+Decision Log, and Interfaces and Dependencies for details; the original Plan of
+Work/Concrete Steps/Interfaces sections below describe the file's pre-addendum
+location and are kept for history.
+
 ### Progress
 
 - [x] (2026-08-12T00:00Z) Read `AGENTS.md`,
@@ -173,6 +184,33 @@ follow-up addendum requested by the user afterward.
       table on every run.
 
 All planned work, including this addendum, is complete.
+
+- [x] (2026-08-18T20:10Z) Moved `test_rydberg_ions.cpp` into its own directory,
+      `mlir/unittests/Dialect/QCO/Transforms/RydbergIons/` (via `git mv`, to
+      preserve history), with its own `CMakeLists.txt` building a new GoogleTest
+      binary, `mqt-core-mlir-unittest-rydberg-ions`; removed it from
+      `mqt-core-mlir-unittest-mapping`'s source list; added the new subdirectory
+      to `mlir/unittests/Dialect/QCO/Transforms/CMakeLists.txt`. See Decision
+      Log for why a standalone sibling directory was chosen over nesting under
+      `Mapping/`.
+- [x] (2026-08-18T20:20Z) Added `routedProgramToOpenQASM3`, which clones the
+      routed QCO module, lowers the clone through the existing `QCOToQC`
+      conversion pass (`mlir::createQCOToQC()`), and translates the result with
+      the existing `mlir::qc::translateQCToOpenQASM3`; wired its output into
+      `dumpRoutedProgram` as a new "routed program as OpenQASM3" section,
+      printed to `llvm::outs()` alongside the existing verbatim-MLIR dump and
+      site table (not in place of them). No changes were needed to `QCOToQC` or
+      the OpenQASM3 translator themselves — both already handle every construct
+      this circuit's routed form produces (`qco.static`'s site surviving as an
+      OpenQASM3 hardware-qubit reference `$N`, `qco.swap` lowering to a `swap`
+      gate call, and two-control `qco.ctrl` lowering to `ctrl(2) @ ...`), so
+      this addendum is confined to the test file and its new `CMakeLists.txt`.
+- [x] (2026-08-18T20:30Z) Rebuilt `mqt-core-mlir-unittest-rydberg-ions` and
+      `mqt-core-mlir-unittest-mapping`; the former's 2 tests pass and print a
+      well-formed `OPENQASM 3.1` program (verified by inspection: header,
+      `output bit` declarations, gate/swap/measure statements addressed by `$N`
+      physical-site references, final output assignments); the latter's
+      remaining 84 tests (86 minus the 2 moved out) pass unchanged.
 
 ### Surprises & Discoveries
 
@@ -573,6 +611,55 @@ All planned work, including this addendum, is complete.
   user chose "document only, defer the fix" via `AskUserQuestion`; no further
   action was taken on `Drivers.h`/`Mapping.cpp` in this plan. Date/Author:
   2026-08-14, implementing agent, per explicit user decision.
+- Decision: put the split-out file in a new sibling directory,
+  `mlir/unittests/Dialect/QCO/Transforms/RydbergIons/`, rather than nesting a
+  subdirectory inside `Mapping/` or leaving it in place with only its
+  `CMakeLists.txt` changed. Rationale: every other standalone unittest binary in
+  this tree (e.g. `Conversion/QCOToQC/`, `Conversion/QCQCORoundTrip/`,
+  `Dialect/QC/Translation/`) gets its own top-level directory under the nearest
+  shared parent, not a subdirectory of a sibling target's directory; following
+  that existing convention keeps `add_subdirectory` wiring consistent with the
+  rest of `mlir/unittests/` and reflects that this file no longer belongs
+  conceptually only to "the Mapping pass's tests" — it now also exercises
+  `QCOToQC` and the OpenQASM3 translator, two dependencies `test_mapping.cpp`
+  itself does not have. `git mv` was used for the move to preserve file history.
+  Date/Author: 2026-08-18, implementing agent.
+- Decision: name the new binary `mqt-core-mlir-unittest-rydberg-ions` (dropping
+  "-mapping" from the name), matching the new directory and the fact that it now
+  covers more than mapping alone. The fixture/test-suite names
+  (`RydbergIonMappingPassFixture`/`RydbergIonMappingPassTest`) were left
+  unchanged since they no longer risk any GoogleTest suite-name collision once
+  in their own binary (see Surprises & Discoveries for the original collision
+  this naming avoided) and renaming them is not needed to satisfy the user's
+  request. Date/Author: 2026-08-18, implementing agent.
+- Decision: add the OpenQASM3 rendering as a second section inside the existing
+  `dumpRoutedProgram` output, alongside the pre-existing verbatim-MLIR dump and
+  site table, rather than replacing the MLIR dump with it. Rationale: the user
+  asked to make "the output" be in QASM "so it can be visualised" — read as
+  adding a visualizable representation, not as a request to drop the MLIR-level
+  detail (inserted `qco.swap` count, structural site table) that the original
+  addendum was built around and that Decision Log/Outcomes already document as
+  load-bearing for the parameter-comparison workflow. Producing both from one
+  dump call is also nearly free: `routedProgramToOpenQASM3` works from a clone
+  of `m`, so it does not disturb the QCO module the rest of the test (including
+  the pre-existing MLIR dump) still uses. Date/Author: 2026-08-18, implementing
+  agent.
+- Decision: implement the OpenQASM3 rendering by reusing the existing,
+  already-tested `mlir::createQCOToQC()` conversion pass and
+  `mlir::qc::translateQCToOpenQASM3` translation function unchanged, rather than
+  writing any new QCO-to-text emission logic in the test file or in production
+  code. Rationale: both already exist specifically for this purpose (QCO is a
+  value-semantics IR not meant to be hand-serialized to QASM directly; the QC
+  dialect and its OpenQASM3 translator are the project's existing
+  "reference-semantics, portable-text" boundary) and, as verified while
+  implementing this, already handle every construct this particular routed
+  circuit produces (`qco.static` site indices survive as OpenQASM3
+  hardware-qubit references `$N`; `qco.swap` lowers to an ordinary `swap` gate
+  call; two-control `qco.ctrl` — the CCX/CCZ shape — lowers to `ctrl(2) @ ...`)
+  with zero changes needed to either component. Confining this addendum entirely
+  to the test file (plus its new `CMakeLists.txt`) keeps it a pure test-side
+  addition, consistent with the original request's "write some code in the test
+  file" scoping. Date/Author: 2026-08-18, implementing agent.
 
 ### Outcomes & Retrospective
 
@@ -660,6 +747,22 @@ the same options). Per the user's explicit choice, it is documented here rather
 than fixed, but it is a real, currently-open limitation of `MappingPass` worth
 prioritizing before anyone relies on comparing two routed outputs for the *same*
 options as a meaningful signal.
+
+**Second addendum outcome (2026-08-18):** the file now builds as its own binary,
+`mqt-core-mlir-unittest-rydberg-ions`, in its own directory,
+`mlir/unittests/Dialect/QCO/Transforms/RydbergIons/`; `test_mapping.cpp`'s
+binary lost no coverage (its 84 remaining tests — 86 minus the 2 moved out —
+pass unchanged). The stdout dump now also renders the fully routed circuit as
+portable OpenQASM3, so it can be pasted directly into an external
+OpenQASM3-capable visualizer to inspect a compiled circuit's routing/placement
+decisions visually, addressing the user's explicit request. This reused two
+pre-existing, unmodified components end-to-end — the `QCOToQC` conversion pass
+and the `translateQCToOpenQASM3` translator — both of which turned out to
+already handle every construct this circuit's routed form produces (physical
+site as an OpenQASM3 hardware-qubit reference, `qco.swap` as a `swap` gate call,
+two-control `qco.ctrl` as `ctrl(2) @ ...`) without any change, so this
+addendum's entire diff is confined to the test file itself and its new
+`CMakeLists.txt`/directory wiring — no production MLIR code changed.
 
 ### Context and Orientation
 
@@ -977,9 +1080,45 @@ focused CMake target named in Concrete Steps; nothing else needs to be reverted.
   `mlir::CompilerTarget`, `mlir::CompilerTarget::Coupling`, and
   `mlir::CompilerTarget::Operation` (`mlir/include/mlir/Compiler/Target.h`).
 
+**2026-08-18 addendum to this section:**
+
+- Moved file (via `git mv`, preserving history)
+  `mlir/unittests/Dialect/QCO/Transforms/Mapping/test_rydberg_ions.cpp` →
+  `mlir/unittests/Dialect/QCO/Transforms/RydbergIons/test_rydberg_ions.cpp`;
+  added `routedProgramToOpenQASM3` (clones the routed module, runs
+  `mlir::createQCOToQC()`, then `mlir::qc::translateQCToOpenQASM3`) and extended
+  `dumpRoutedProgram` with an OpenQASM3 section using its output; registered
+  `mlir::qc::QCDialect` in the fixture's `SetUp` (needed by the cloned module's
+  context once it contains `qc.*` ops).
+- New file `mlir/unittests/Dialect/QCO/Transforms/RydbergIons/CMakeLists.txt`:
+  defines the new `mqt-core-mlir-unittest-rydberg-ions` executable, linking the
+  same libraries `test_mapping.cpp`'s target used (`MLIRParser`,
+  `MQTCompilerTarget`, `MLIRQCOProgramBuilder`, `MLIRQTensorUtils`,
+  `MLIRQCOTransforms`, `MLIRSupportMQT`, `GTest::gtest_main`) plus two new ones
+  this addendum needs: `MLIRQCOToQC` (`mlir::createQCOToQC`, from
+  `mlir/include/mlir/Conversion/QCOToQC/QCOToQC.h`) and
+  `MLIRQCOpenQASMTranslation` (`mlir::qc::translateQCToOpenQASM3`, from
+  `mlir/include/mlir/Dialect/QC/Translation/TranslateQCToOpenQASM3.h`; also
+  provides `mlir::qc::QCDialect` transitively).
+- Modified file `mlir/unittests/Dialect/QCO/Transforms/Mapping/CMakeLists.txt`:
+  the `add_executable` source list loses `test_rydberg_ions.cpp` (reverting the
+  2026-08-13 addition recorded above).
+- Modified file `mlir/unittests/Dialect/QCO/Transforms/CMakeLists.txt`: gains
+  `add_subdirectory(RydbergIons)`.
+- Consumes, unmodified: `mlir::createQCOToQC()`
+  (`mlir/lib/Conversion/QCOToQC/QCOToQC.cpp`) and
+  `mlir::qc::translateQCToOpenQASM3`
+  (`mlir/lib/Dialect/QC/Translation/TranslateQCToOpenQASM3.cpp`) — both
+  pre-existing, general-purpose components, neither modified by this addendum.
+
 When you revise this ExecPlan, ensure the change is reflected across all
 relevant sections above, and add a note here describing what changed and why.
-This version (2026-08-12, third revision) trims the router-generalization design
-out into its own ExecPlan, `.agent/plans/native-multi-qubit-gate-routing.md`,
-per explicit user request, leaving this plan focused solely on the Bacon-Shor
-circuit/test that depends on it.
+This version (2026-08-18, fourth revision) records splitting the Rydberg-ion
+test into its own GoogleTest binary and adding an OpenQASM3 rendering of the
+routed circuit to its stdout dump, both per explicit user follow-up request; see
+the Addendum paragraph in Purpose/Big Picture and the newest Decision Log
+entries for the reasoning. The previous revision's Plan of Work, Concrete Steps,
+and the un-addended parts of Interfaces and Dependencies describe the file's
+pre-2026-08-18 location (`Mapping/test_rydberg_ions.cpp` built into
+`mqt-core-mlir-unittest-mapping`) and are kept for history rather than rewritten
+in place.

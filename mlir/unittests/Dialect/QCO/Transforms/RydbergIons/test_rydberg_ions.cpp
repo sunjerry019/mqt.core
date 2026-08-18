@@ -9,6 +9,9 @@
  */
 
 #include "mlir/Compiler/Target.h"
+#include "mlir/Conversion/QCOToQC/QCOToQC.h"
+#include "mlir/Dialect/QC/IR/QCDialect.h"
+#include "mlir/Dialect/QC/Translation/TranslateQCToOpenQASM3.h"
 #include "mlir/Dialect/QCO/Builder/QCOProgramBuilder.h"
 #include "mlir/Dialect/QCO/IR/QCODialect.h"
 #include "mlir/Dialect/QCO/IR/QCOInterfaces.h"
@@ -75,8 +78,8 @@ class RydbergIonMappingPassFixture : public testing::Test {
 protected:
   void SetUp() override {
     DialectRegistry registry;
-    registry.insert<QCODialect, qtensor::QTensorDialect, scf::SCFDialect,
-                    arith::ArithDialect, func::FuncDialect>();
+    registry.insert<QCODialect, qc::QCDialect, qtensor::QTensorDialect,
+                    scf::SCFDialect, arith::ArithDialect, func::FuncDialect>();
     context = std::make_unique<MLIRContext>();
     context->appendDialectRegistry(registry);
     context->loadAllAvailableDialects();
@@ -467,20 +470,47 @@ static CompilerTarget::SiteId traceToInitialSite(Value v) {
   return cast<StaticOp>(v.getDefiningOp()).getIndex();
 }
 
+/// Lower a routed QCO module to portable OpenQASM3 on a throwaway clone, so
+/// the resulting program can be pasted into any OpenQASM3-capable visualizer
+/// to inspect the router's actual placement/routing decisions.
+///
+/// The clone (not `m` itself) is converted so that `m` survives, still in QCO
+/// form, for the QCO-specific assertions (`numSwaps`,
+/// `numNativeMultiQubitGates`) that run after the dump. `qco.static`'s `index`
+/// becomes `qc.static`'s unchanged across `QCOToQC` (see `ConvertQCOStaticOp`),
+/// and `translateQCToOpenQASM3` renders every `qc.static` qubit as an OpenQASM3
+/// hardware-qubit reference (`$N`), so the emitted program's qubit references
+/// are exactly the physical sites `MappingPass` assigned — including every
+/// inserted `qco.swap`, which lowers to an ordinary `swap $a, $b;` gate call
+/// alongside the rest of the circuit.
+static FailureOr<std::string> routedProgramToOpenQASM3(ModuleOp m) {
+  OwningOpRef<ModuleOp> qcModule(cast<ModuleOp>(m->clone()));
+  PassManager pm(qcModule->getContext());
+  pm.addPass(createQCOToQC());
+  if (failed(pm.run(*qcModule)) || failed(verify(*qcModule))) {
+    return failure();
+  }
+  return qc::translateQCToOpenQASM3(*qcModule);
+}
+
 /// Print the fully routed program (every surviving gate and every inserted
-/// `qco.swap`, verbatim as MLIR) together with each named program qubit's
-/// initial and final physical site, to `os` for manual analysis.
+/// `qco.swap`, verbatim as MLIR and as OpenQASM3) together with each named
+/// program qubit's initial and final physical site, to `os` for manual
+/// analysis.
 ///
 /// This always runs (it is not gated behind `-debug`) and is written to
 /// stdout by its caller: rerunning the test after changing a
 /// `MappingPassOptions` field (e.g. `qubitTypeLabels`, `alpha`, `lambda`,
 /// `seed`) is meant to be enough to inspect how the routing decision
-/// changes, without re-instrumenting the test by hand.
+/// changes, without re-instrumenting the test by hand. The OpenQASM3 section
+/// exists specifically so the routed circuit can be visualized in an external
+/// tool, which the verbatim MLIR dump does not support.
 static void
 dumpRoutedProgram(llvm::raw_ostream& os, ModuleOp m,
                   const MappingPassOptions& options,
                   ArrayRef<QubitTrace> traces,
-                  const DenseMap<Value, CompilerTarget::SiteId>& siteMap) {
+                  const DenseMap<Value, CompilerTarget::SiteId>& siteMap,
+                  StringRef openQasm3) {
   os << "\n"
         "================================================================\n"
         "Bacon-Shor routing analysis dump\n"
@@ -503,7 +533,11 @@ dumpRoutedProgram(llvm::raw_ostream& os, ModuleOp m,
     os << "  " << trace.name << ": " << initialSite << " -> " << finalSite
        << "\n";
   }
-  os << "================================================================\n";
+  os << "\n--- routed program as OpenQASM3 (paste into any OpenQASM3 "
+        "visualizer; physical sites are hardware-qubit references, e.g. "
+        "$7) ---\n"
+     << openQasm3
+     << "================================================================\n";
 }
 
 } // namespace
@@ -530,11 +564,15 @@ TEST_F(RydbergIonMappingPassFixture, MapBaconShorCodeOnRydbergIonTarget) {
   EXPECT_TRUE(
       isExecutable(getEntryPoint(m.get()).getFunctionBody(), siteMap, target));
 
+  const FailureOr<std::string> openQasm3 = routedProgramToOpenQASM3(m.get());
+  ASSERT_TRUE(succeeded(openQasm3));
+
   // Always printed to stdout (not gated behind -debug): shows the fully
   // routed circuit plus each program qubit's initial/final physical site, so
   // that rerunning with different `MappingPassOptions` (e.g. `qubitTypeLabels`,
   // `alpha`, `lambda`, `seed`) can be inspected without extra instrumentation.
-  dumpRoutedProgram(llvm::outs(), m.get(), options, program.traces, siteMap);
+  dumpRoutedProgram(llvm::outs(), m.get(), options, program.traces, siteMap,
+                    *openQasm3);
 
   size_t numSwaps = 0;
   m->walk([&](SWAPOp) { ++numSwaps; });
