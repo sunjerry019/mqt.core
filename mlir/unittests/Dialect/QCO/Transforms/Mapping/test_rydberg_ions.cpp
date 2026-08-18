@@ -21,12 +21,14 @@
 #include "mlir/Support/Passes.h"
 
 #include <gtest/gtest.h>
+#include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/Sequence.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/TypeSwitch.h>
 #include <llvm/Support/Debug.h>
 #include <llvm/Support/LogicalResult.h>
+#include <llvm/Support/raw_ostream.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
@@ -236,6 +238,14 @@ constexpr std::array<std::array<int64_t, 6>, 3> kSz{{
 struct BaconShorCircuit {
   SmallVector<Value> dataQubits = SmallVector<Value>(9);
   SmallVector<Value> ancillaQubits = SmallVector<Value>(3);
+
+  /// The qubit values immediately after allocation, before any gate has
+  /// consumed them. `buildBaconShorCircuit` never reads these back; they
+  /// exist purely as test instrumentation so that
+  /// `buildAndFinalizeBaconShorProgram` can locate, for each program qubit, the
+  /// very first operation that consumes it (see `QubitTrace` below).
+  SmallVector<Value> initialDataQubits = SmallVector<Value>(9);
+  SmallVector<Value> initialAncillaQubits = SmallVector<Value>(3);
 };
 
 /// Mirrors `BaconShorCodeCircuitGenerator.x_syndrome_circuit`.
@@ -329,11 +339,12 @@ void buildZCorrectionCircuit(QCOProgramBuilder& builder,
 /// correct_x_circuit + z_syndrome_circuit + correct_z_circuit`.
 BaconShorCircuit buildBaconShorCircuit(QCOProgramBuilder& builder) {
   BaconShorCircuit circuit;
-  for (Value& q : circuit.dataQubits) {
-    q = builder.allocQubit();
+  for (size_t i = 0; i < circuit.dataQubits.size(); ++i) {
+    circuit.dataQubits[i] = circuit.initialDataQubits[i] = builder.allocQubit();
   }
-  for (Value& q : circuit.ancillaQubits) {
-    q = builder.allocQubit();
+  for (size_t i = 0; i < circuit.ancillaQubits.size(); ++i) {
+    circuit.ancillaQubits[i] = circuit.initialAncillaQubits[i] =
+        builder.allocQubit();
   }
 
   buildXSyndromeCircuit(builder, circuit);
@@ -343,6 +354,35 @@ BaconShorCircuit buildBaconShorCircuit(QCOProgramBuilder& builder) {
 
   return circuit;
 }
+
+/// Traces a single named Bacon-Shor program qubit (one of the 9 data qubits
+/// or 3 QEC ancillas) through the mapping pass, so its physical site can be
+/// recovered before and after routing without reaching into the pass's
+/// internal `Layout`.
+///
+/// The anchors are two operations that the mapping pass never erases or
+/// replaces (`place()` only erases `AllocQubitOp`/`ExtractOp`/`InsertOp`/
+/// `DeallocOp`, and routing only rewires *operands* via
+/// `replaceAllUsesExcept`, never the surviving gate `Operation*`s
+/// themselves): the gate that first consumes the qubit right after
+/// allocation, and the `qco.measure` that consumes it last (added by
+/// `buildAndFinalizeBaconShorProgram`). After the pass has run, re-reading
+/// the anchor's current operand and looking that value up in the site map
+/// `isExecutable` builds recovers the qubit's site at that point in time.
+struct QubitTrace {
+  std::string name;
+  Operation* firstUser = nullptr;
+  unsigned firstOperandIdx = 0;
+  Operation* lastUser = nullptr;
+  unsigned lastOperandIdx = 0;
+};
+
+/// A finalized Bacon-Shor program together with a `QubitTrace` per program
+/// qubit (data qubits first, then ancillas), for post-routing analysis.
+struct BaconShorProgram {
+  OwningOpRef<ModuleOp> module;
+  SmallVector<QubitTrace, 12> traces;
+};
 
 /// Build the full Bacon-Shor QEC round on a fresh `QCOProgramBuilder`, then
 /// measure and sink all 12 qubits, returning the finalized module together
@@ -359,22 +399,42 @@ BaconShorCircuit buildBaconShorCircuit(QCOProgramBuilder& builder) {
 /// assertion below into a vacuous pass over an empty function. Measuring
 /// forces the routed gates to remain observable so the tests below actually
 /// exercise them.
-static OwningOpRef<ModuleOp>
-buildAndFinalizeBaconShorProgram(MLIRContext* ctx) {
+static BaconShorProgram buildAndFinalizeBaconShorProgram(MLIRContext* ctx) {
   QCOProgramBuilder builder(ctx);
   constexpr int64_t numQubits = 12;
   builder.initialize(SmallVector<Type>(numQubits, builder.getI1Type()));
 
   BaconShorCircuit circuit = buildBaconShorCircuit(builder);
 
+  // Anchor each program qubit's *first* user now, while its initial,
+  // freshly allocated value still has exactly one use (the whole circuit
+  // is already built at this point, just not yet measured/finalized).
+  SmallVector<QubitTrace, 12> traces;
+  const auto traceFirstUse = [](const std::string& name, Value initial) {
+    assert(initial.hasOneUse() &&
+           "expected a freshly allocated qubit to have exactly one use");
+    OpOperand& use = *initial.getUses().begin();
+    return QubitTrace{name, use.getOwner(), use.getOperandNumber(), nullptr, 0};
+  };
+  for (size_t i = 0; i < circuit.initialDataQubits.size(); ++i) {
+    traces.push_back(traceFirstUse("data" + std::to_string(i),
+                                   circuit.initialDataQubits[i]));
+  }
+  for (size_t i = 0; i < circuit.initialAncillaQubits.size(); ++i) {
+    traces.push_back(traceFirstUse("ancilla" + std::to_string(i),
+                                   circuit.initialAncillaQubits[i]));
+  }
+
   SmallVector<Value> bits(numQubits);
   for (size_t i = 0; i < circuit.dataQubits.size(); ++i) {
     std::tie(circuit.dataQubits[i], bits[i]) =
         builder.measure(circuit.dataQubits[i]);
+    traces[i].lastUser = bits[i].getDefiningOp();
   }
   for (size_t i = 0; i < circuit.ancillaQubits.size(); ++i) {
     std::tie(circuit.ancillaQubits[i], bits[9 + i]) =
         builder.measure(circuit.ancillaQubits[i]);
+    traces[9 + i].lastUser = bits[9 + i].getDefiningOp();
   }
   for (const Value q : circuit.dataQubits) {
     builder.sink(q);
@@ -383,7 +443,67 @@ buildAndFinalizeBaconShorProgram(MLIRContext* ctx) {
     builder.sink(q);
   }
 
-  return builder.finalize(bits);
+  return BaconShorProgram{builder.finalize(bits), std::move(traces)};
+}
+
+/// Trace a qubit operand back to the physical site its `qco.static` was
+/// created with, i.e. the site the mapping pass's initial layout actually
+/// assigned to it, unaffected by any routing decision.
+///
+/// A qubit's very first real (non-`qco.static`) use may be preceded by a
+/// `qco.swap` the router inserted purely to satisfy adjacency for that same
+/// gate, so `v` is not necessarily the qubit's `qco.static` value itself.
+/// Walking backward from `v` therefore has to follow *identity*, not site:
+/// `insertSWAPs` (`Mapping.cpp`) wires a swap's first result to continue
+/// whichever logical qubit its *second* input represented, and vice versa
+/// (`replaceAllUsesExcept(in0, out1, ...)` / `replaceAllUsesExcept(in1,
+/// out0, ...)`), so recovering "this same logical qubit, one step earlier"
+/// means crossing to the *other* input at each swap — the opposite of the
+/// same-slot, site-preserving traversal `isExecutable`'s site map uses.
+static CompilerTarget::SiteId traceToInitialSite(Value v) {
+  while (auto swap = dyn_cast_or_null<SWAPOp>(v.getDefiningOp())) {
+    v = v == swap.getQubit0Out() ? swap.getQubit1In() : swap.getQubit0In();
+  }
+  return cast<StaticOp>(v.getDefiningOp()).getIndex();
+}
+
+/// Print the fully routed program (every surviving gate and every inserted
+/// `qco.swap`, verbatim as MLIR) together with each named program qubit's
+/// initial and final physical site, to `os` for manual analysis.
+///
+/// This always runs (it is not gated behind `-debug`) and is written to
+/// stdout by its caller: rerunning the test after changing a
+/// `MappingPassOptions` field (e.g. `qubitTypeLabels`, `alpha`, `lambda`,
+/// `seed`) is meant to be enough to inspect how the routing decision
+/// changes, without re-instrumenting the test by hand.
+static void
+dumpRoutedProgram(llvm::raw_ostream& os, ModuleOp m,
+                  const MappingPassOptions& options,
+                  ArrayRef<QubitTrace> traces,
+                  const DenseMap<Value, CompilerTarget::SiteId>& siteMap) {
+  os << "\n"
+        "================================================================\n"
+        "Bacon-Shor routing analysis dump\n"
+        "================================================================\n"
+     << "options: nlookahead=" << options.nlookahead
+     << " alpha=" << options.alpha << " lambda=" << options.lambda
+     << " niterations=" << options.niterations << " ntrials=" << options.ntrials
+     << " seed=" << options.seed << " qubitTypeLabels=\""
+     << (options.qubitTypeLabels.empty() ? "<default>"
+                                         : options.qubitTypeLabels)
+     << "\"\n\n"
+     << "--- routed program (gates + inserted qco.swap ops) ---\n";
+  m.print(os);
+  os << "\n\n--- program qubit -> physical site (initial -> final) ---\n";
+  for (const QubitTrace& trace : traces) {
+    const auto initialSite =
+        traceToInitialSite(trace.firstUser->getOperand(trace.firstOperandIdx));
+    const auto finalSite =
+        siteMap.at(trace.lastUser->getOperand(trace.lastOperandIdx));
+    os << "  " << trace.name << ": " << initialSite << " -> " << finalSite
+       << "\n";
+  }
+  os << "================================================================\n";
 }
 
 } // namespace
@@ -391,7 +511,8 @@ buildAndFinalizeBaconShorProgram(MLIRContext* ctx) {
 TEST_F(RydbergIonMappingPassFixture, MapBaconShorCodeOnRydbergIonTarget) {
   const auto target = getRydbergIonTarget();
 
-  auto m = buildAndFinalizeBaconShorProgram(context.get());
+  auto program = buildAndFinalizeBaconShorProgram(context.get());
+  auto& m = program.module;
   ASSERT_TRUE(succeeded(verify(*m)));
 
   // Label the 9 data qubits "B" (data) and the 3 QEC ancillas "A"
@@ -400,12 +521,20 @@ TEST_F(RydbergIonMappingPassFixture, MapBaconShorCodeOnRydbergIonTarget) {
   // on this target (see getRydbergIonTarget), so no decomposition pass runs
   // here at all.
   const std::string qubitTypeLabels = std::string(9, 'B') + std::string(3, 'A');
-  ASSERT_TRUE(runPass(m.get(), target,
-                      MappingPassOptions{.ntrials = 1,
-                                         .qubitTypeLabels = qubitTypeLabels})
-                  .succeeded());
+  const MappingPassOptions options{.ntrials = 1,
+                                   .qubitTypeLabels = qubitTypeLabels};
+  ASSERT_TRUE(runPass(m.get(), target, options).succeeded());
   ASSERT_TRUE(succeeded(verify(*m)));
-  EXPECT_TRUE(isExecutable(getEntryPoint(m.get()), target));
+
+  DenseMap<Value, CompilerTarget::SiteId> siteMap;
+  EXPECT_TRUE(
+      isExecutable(getEntryPoint(m.get()).getFunctionBody(), siteMap, target));
+
+  // Always printed to stdout (not gated behind -debug): shows the fully
+  // routed circuit plus each program qubit's initial/final physical site, so
+  // that rerunning with different `MappingPassOptions` (e.g. `qubitTypeLabels`,
+  // `alpha`, `lambda`, `seed`) can be inspected without extra instrumentation.
+  dumpRoutedProgram(llvm::outs(), m.get(), options, program.traces, siteMap);
 
   size_t numSwaps = 0;
   m->walk([&](SWAPOp) { ++numSwaps; });
@@ -432,7 +561,8 @@ TEST_F(RydbergIonMappingPassFixture,
        MapBaconShorCodeOnRydbergIonTargetWithDefaultCost) {
   const auto target = getRydbergIonTarget();
 
-  auto m = buildAndFinalizeBaconShorProgram(context.get());
+  auto program = buildAndFinalizeBaconShorProgram(context.get());
+  auto& m = program.module;
   ASSERT_TRUE(succeeded(verify(*m)));
 
   // Leaving `qubitTypeLabels` unset (the default) must still compile the

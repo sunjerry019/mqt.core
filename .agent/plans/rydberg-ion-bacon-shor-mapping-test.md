@@ -54,6 +54,20 @@ gate remains exactly the atomic three-qubit gate the circuit started with (no
 decomposition ever happens), and that the same circuit still compiles when
 `qubit-type-labels` is left at its default (unset).
 
+**Addendum (2026-08-13/14):** at the user's follow-up request, after the above
+was complete, `MapBaconShorCodeOnRydbergIonTarget` was extended with a permanent
+(not `-debug`-gated, not removed after use) analysis dump to stdout: the fully
+routed program (every surviving gate and every inserted `qco.swap`, verbatim
+MLIR) plus, per named program qubit, its physical site immediately after
+allocation (before any routing decision) and immediately before its (test-only)
+measurement. The intent, per the user, is to let them change a
+`MappingPassOptions` field (e.g. `qubitTypeLabels`, `alpha`, `lambda`) and rerun
+the test binary directly to see how the compiled circuit changes, without
+re-instrumenting anything by hand. See Surprises & Discoveries for a
+significant, unrelated finding this work surfaced (`MappingPass` routing is not
+actually run-to-run deterministic, even with a fixed seed) and Decision Log for
+why that finding is documented but not fixed here.
+
 ### Progress
 
 - [x] (2026-08-12T00:00Z) Read `AGENTS.md`,
@@ -118,7 +132,47 @@ decomposition ever happens), and that the same circuit still compiles when
 - [x] (2026-08-13T02:30Z) Final read-through of the diff against `AGENTS.md` and
       this plan; see Outcomes & Retrospective below.
 
-All planned work is complete.
+All planned work (the original scope) is complete. The following items track a
+follow-up addendum requested by the user afterward.
+
+- [x] (2026-08-13T23:30Z) Added `QubitTrace`/`BaconShorProgram` and extended
+      `BaconShorCircuit` with `initialDataQubits`/`initialAncillaQubits` so each
+      named program qubit's freshly-allocated (pre-pass) value and its final
+      (pre-measurement) `Operation*` anchor are captured for later lookup,
+      without exposing any of `MappingPass`'s internal `Layout`.
+- [x] (2026-08-13T23:45Z) Added `dumpRoutedProgram`, printing the fully routed
+      module plus a per-qubit initial/final physical-site table to
+      `llvm::outs()` unconditionally (not gated behind `-debug`), and wired it
+      into `MapBaconShorCodeOnRydbergIonTarget`.
+- [x] (2026-08-14T00:15Z) While validating the dump's own correctness, found and
+      fixed a real bug in the *test's* site-tracing logic (not in
+      `MappingPass`): the naive approach (look up the qubit's first-use operand
+      directly in the site map `isExecutable` already builds) can report a
+      *post-preparatory-swap* site as "initial" whenever the router inserts a
+      `qco.swap` immediately before a qubit's very first real gate. Confirmed
+      empirically (two named qubits both showing initial site `7` in one run)
+      and fixed with `traceToInitialSite`, an identity-crossing backward walk
+      through any such `qco.swap`s back to the qubit's `qco.static` origin; see
+      Surprises & Discoveries and Decision Log. Re-verified across 5 consecutive
+      runs: the printed initial-site column is always a full bijection over
+      sites 0-11.
+- [x] (2026-08-14T00:30Z) While re-verifying determinism of the printed output,
+      discovered `MappingPass` itself is not run-to-run deterministic even with
+      a fixed `seed` and `ntrials=1` (swap counts 83/85/86/86/93 across 5
+      identical runs). Root-caused to `ReadyMap`
+      (`mlir/include/mlir/Dialect/QCO/Utils/Drivers.h:37`, an
+      `Operation*`-pointer-keyed `SmallDenseMap`) being iterated directly in
+      `Mapping.cpp`'s `advance()`, whose bucket order depends on raw pointer
+      values that vary run-to-run (ASLR/heap layout) — confirmed independent of
+      `MLIRContext` threading by temporarily disabling multithreading (variance
+      persisted). Reported to the user; per their explicit choice, documented
+      here and left unfixed — see Decision Log.
+- [x] (2026-08-14T00:35Z) Rebuilt `mqt-core-mlir-unittest-mapping`; both
+      `RydbergIonMappingPassFixture` tests pass, and the dump prints a
+      self-consistent, bijective initial-site table and a non-empty final-site
+      table on every run.
+
+All planned work, including this addendum, is complete.
 
 ### Surprises & Discoveries
 
@@ -231,6 +285,68 @@ All planned work is complete.
   per syndrome round, a much denser interaction pattern than the sparse target
   topology directly supports without relayouting. This debug instrumentation was
   removed after verification; it is not part of the committed test.
+- Observation: computing a named program qubit's "initial physical site" is
+  *not* as simple as looking up the site of the operand feeding its first real
+  gate in the site map `isExecutable` already builds (forward `StaticOp` →
+  same-slot propagation through every op including `qco.swap`, which never
+  changes site along a given operand slot — see the next bullet). If the router
+  needs a `qco.swap` to satisfy adjacency for that very first gate, that swap is
+  spliced in *before* the gate, between the qubit's `qco.static` origin and the
+  gate itself; the naive lookup then reports the *post*-swap site, not the
+  qubit's true site at t=0. This first showed up as two different named qubits
+  (`data6` and `ancilla2`) both reporting initial site `7` in one run —
+  impossible for a real t=0 layout (12 qubits occupying 12 distinct sites
+  simultaneously), which is what revealed the bug rather than a
+  plausible-looking but wrong number. Adding a `[preSwap=...]` debug flag
+  (checking whether the first-use operand's `getDefiningOp()` was a `SWAPOp`)
+  confirmed several qubits genuinely do get a preparatory swap before their
+  first real gate. Fixed with `traceToInitialSite`; see Decision Log.
+- Observation: a `qco.swap`'s two structural "slots" and the
+  *logical qubit identity* flowing through them are governed by opposite
+  crossing rules, and conflating them was the root cause of the bug above.
+  `insertSWAPs` (`Mapping.cpp`) creates each `SWAPOp` from `(in0, in1)` to
+  `(out0, out1)` and then calls `replaceAllUsesExcept(in0, out1, swapOp)` /
+  `replaceAllUsesExcept(in1, out0, swapOp)`: *site* is preserved same-slot
+  (`out0` is always "physically at `in0`'s site", regardless of which logical
+  qubit that now is — this is what makes `isExecutable`'s forward
+  `pred[i] -> succ[i]` site propagation correct), while *logical identity*
+  crosses (whichever program qubit `in0` represented is, from that point on,
+  represented by `out1`, not `out0`). Recovering "the site a specific named
+  qubit started at" requires walking backward along the *identity* (crossed)
+  path, not the site (same-slot) path — the opposite of what the existing site
+  map already does forward. Confirmed by direct backward-then-forward
+  round-tripping: after switching `traceToInitialSite` to the crossed rule, five
+  consecutive runs all produced a full 0-11 bijection for the initial-site
+  column, with no code change to `MappingPass` itself.
+- **Significant, unrelated discovery:** `MappingPass`'s routing output is not
+  actually deterministic run-to-run for identical inputs and options, despite a
+  fixed `seed` and `ntrials=1`. Running the exact same test binary invocation
+  five times in a row produced 83, 85, 86, 86, and 93 `qco.swap` ops
+  respectively (and correspondingly different specific swaps/final sites),
+  purely from re-launching the process — no source or option change between
+  runs. Root cause traced to `mlir/include/mlir/Dialect/QCO/Utils/Drivers.h:37`:
+  `using ReadyMap = llvm::SmallDenseMap<Operation*, SmallVector<size_t>, 8>;` —
+  a hash map keyed on raw `Operation*` pointer values. `Mapping.cpp`'s
+  `advance()` (and `route()`'s use of it, called from `generateLayout`'s
+  forward/backward SABRE passes) iterates this map directly
+  (`for (const auto& [op, indices] : ready)`) to decide which of several
+  simultaneously-"ready" gates to release/process next; `SmallDenseMap`'s
+  iteration order follows bucket order, which depends on the pointer hash of the
+  keys — and `Operation*` addresses are heap-allocated, so they vary between
+  process launches (ASLR/heap layout), even with every RNG seed held fixed. This
+  directly explains the observed run-to-run swap-count variance: when the search
+  has a genuine tie among candidate SWAPs (common in a dense, ~90-gate circuit
+  routed on a sparse topology), which one gets explored/chosen first depends on
+  this pointer-hash-order tie-break. Verified this is not a threading artifact:
+  temporarily calling `context->disableMultithreading()` in the test fixture's
+  `SetUp` did not reduce the variance (still 79/92/84/92/84 across 5 runs), then
+  reverted. This predates this session's work (nothing in this plan or in
+  `.agent/plans/native-multi-qubit-gate-routing.md` touches `Drivers.h` or
+  `advance()`'s iteration order) and affects `MappingPass` generally, not only
+  this test. Reported to the user with the exact file/line and reasoning; per
+  their explicit choice ("document only, defer the fix") this is recorded here
+  as a known limitation and intentionally left unfixed by this plan — see
+  Decision Log.
 
 ### Decision Log
 
@@ -397,6 +513,66 @@ All planned work is complete.
   counts the circuit's 36 CNOTs alongside its 6 CCZ/CCX gates; the two-control
   filter isolates exactly the native multi-qubit gates this test's arity
   assertion is actually about. Date/Author: 2026-08-13, implementing agent.
+- Decision: recover each named qubit's initial/final physical site by anchoring
+  on `Operation*` handles captured *before* running `MappingPass` (the gate that
+  first consumes the qubit's fresh allocation, and the `qco.measure` that
+  consumes it last), then re-reading those same operations' *current* operands
+  after the pass has run, rather than exposing any new API from
+  `Mapping.h`/`Mapping.cpp`. Rationale: `place()` only erases
+  `AllocQubitOp`/`ExtractOp`/`InsertOp`/`DeallocOp` and routing only ever
+  rewires *operands* (`replaceAllUsesWith`/`replaceAllUsesExcept`), never
+  erasing or replacing an existing gate `Operation*` — so these anchors are
+  guaranteed to survive the pass unchanged, making this fully self-contained in
+  the test file and requiring zero changes to production `MappingPass`/`Layout`
+  code, consistent with the user's request being scoped to "in the newly written
+  test... write some code". Date/Author: 2026-08-14, implementing agent.
+- Decision: use two different backward-tracing rules for the two directions
+  needed — the existing `isExecutable` site map (same-slot, forward) for the
+  *final* site (unambiguous already: a qubit's last touch, right before its own
+  measurement, is by definition after every swap relevant to it), and a new,
+  separate `traceToInitialSite` helper (identity-crossing, backward) for the
+  *initial* site, which needs to see past any preparatory swap inserted before a
+  qubit's first real gate. Rationale: reusing the site-map's same-slot rule for
+  the initial-site case was tried first and is what produced the impossible
+  duplicate-site-7 result recorded in Surprises & Discoveries; the two
+  directions are genuinely not interchangeable. Date/Author: 2026-08-14,
+  implementing agent.
+- Decision: print the dump unconditionally to `llvm::outs()` from inside
+  `MapBaconShorCodeOnRydbergIonTarget` (not gated behind `-debug`, and not a
+  temporary instrumentation removed after use, unlike the earlier debug dumps
+  used during the original investigation). Rationale: explicit user request —
+  "The side effect should basically be outputted to STDOUT upon running the
+  compiled test" — specifically so that re-running the test binary after editing
+  a `MappingPassOptions` field is, by itself, enough to see the new compiled
+  circuit and layout, without re-adding instrumentation each time. Also print
+  the exact `MappingPassOptions` used at the top of the dump, so a given run's
+  output is self-describing. Date/Author: 2026-08-14, implementing agent.
+- Decision: do not add this dump to
+  `MapBaconShorCodeOnRydbergIonTargetWithDefaultCost`. Rationale: the user's
+  request referred to "the newly written test to compile the Bacon Shor Circuit"
+  (singular); `MapBaconShorCodeOnRydbergIonTarget` (the one that engages the
+  state-dependent A/B heuristic and was the subject of the earlier zero-swap
+  investigation) is the one meant for this kind of parameter-tuning analysis,
+  while the default-cost test exists only to confirm the pass still compiles
+  with `qubitTypeLabels` unset — printing the same dump there would be
+  redundant, unrequested output. `buildAndFinalizeBaconShorProgram` still
+  returns `BaconShorProgram` (traces included) uniformly for both tests, so
+  adding the same dump call to the second test later, if ever wanted, is a
+  two-line change. Date/Author: 2026-08-14, implementing agent.
+- Decision: report the `MappingPass` non-determinism finding to the user before
+  proceeding further, rather than silently fixing it, silently ignoring it, or
+  silently changing the dump's scope to route around it (e.g. by only ever
+  printing swap *counts* instead of exact layouts). Rationale: it directly
+  affects the tool the user asked for — the whole point of the dump is to let
+  them compare output across parameter changes, and that comparison is
+  unreliable if even an *identical* rerun can differ. Fixing `ReadyMap`'s
+  iteration order is a nontrivial change to shared, general-purpose routing
+  infrastructure (`Drivers.h`/`Mapping.cpp`), well outside "write some code in
+  the test file to extract the final circuit... for analysis purposes", so it
+  warranted an explicit decision from the user rather than being bundled in. The
+  user chose "document only, defer the fix" via `AskUserQuestion`; no further
+  action was taken on `Drivers.h`/`Mapping.cpp` in this plan. Date/Author:
+  2026-08-14, implementing agent, per explicit user decision.
 
 ### Outcomes & Retrospective
 
@@ -462,6 +638,28 @@ onto a sparse topology) as worth investigating rather than accepting, and
 independently extracting and reviewing the actual compiled artifact rather than
 trusting the assertions alone, is what caught this — a concrete instance of the
 broader practice this repository's prior ExecPlans already document valuing.
+
+**Addendum outcome:** the follow-up analysis-dump request surfaced two more
+issues via the exact same discipline — treating a "too clean" or "impossible"
+result as worth investigating rather than accepting. First, a duplicate "initial
+site" reading across two named qubits in one run was caught (not a
+plausible-looking wrong number, but a structurally impossible one for a
+12-into-12 bijective t=0 layout), leading to the identity-crossing
+`traceToInitialSite` fix; the printed initial-site column is now verified to be
+a full bijection over 5 consecutive runs. Second, and considerably more
+significant: verifying the dump's stability across reruns revealed that
+`MappingPass` itself is not deterministic run-to-run for identical inputs and
+options — traced to pointer-hash-order iteration of a
+`SmallDenseMap<Operation*, ...>` (`ReadyMap` in `Drivers.h`) inside
+`Mapping.cpp`'s `advance()`, confirmed independent of `MLIRContext` threading.
+This is a pre-existing property of `MappingPass` general routing, not introduced
+by this plan or by `.agent/plans/native-multi-qubit-gate-routing.md`, and not
+something either plan's original scope would have caught (both validated
+correctness of a single routing result, never reproducibility across reruns of
+the same options). Per the user's explicit choice, it is documented here rather
+than fixed, but it is a real, currently-open limitation of `MappingPass` worth
+prioritizing before anyone relies on comparing two routed outputs for the *same*
+options as a meaningful signal.
 
 ### Context and Orientation
 
