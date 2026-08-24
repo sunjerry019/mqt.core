@@ -552,6 +552,11 @@ dumpRoutedProgram(llvm::raw_ostream& os, ModuleOp m,
         "$7) ---\n"
      << openQasm3
      << "================================================================\n";
+  // Flush immediately: `os` (llvm::outs()) buffers independently of gtest's
+  // own stdio-based progress output, so without an explicit flush here the
+  // two can interleave out of call order once stdout is redirected to a
+  // file (stdio switches from line- to full-buffering off a tty).
+  os.flush();
 }
 
 } // namespace
