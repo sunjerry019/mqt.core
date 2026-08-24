@@ -428,6 +428,20 @@ static BaconShorProgram buildAndFinalizeBaconShorProgram(MLIRContext* ctx) {
                                    circuit.initialAncillaQubits[i]));
   }
 
+  // Separate the routed circuit from the dummy instrumentation measurements
+  // with a barrier, so the two are visually distinguishable in the OpenQASM3
+  // dump and the mapping pass cannot reorder circuit gates across the
+  // measurement boundary.
+  SmallVector<Value> preMeasureQubits(circuit.dataQubits.begin(),
+                                      circuit.dataQubits.end());
+  preMeasureQubits.append(circuit.ancillaQubits.begin(),
+                          circuit.ancillaQubits.end());
+  const ValueRange barriered = builder.barrier(preMeasureQubits);
+  std::copy_n(barriered.begin(), circuit.dataQubits.size(),
+              circuit.dataQubits.begin());
+  std::copy_n(barriered.begin() + circuit.dataQubits.size(),
+              circuit.ancillaQubits.size(), circuit.ancillaQubits.begin());
+
   SmallVector<Value> bits(numQubits);
   for (size_t i = 0; i < circuit.dataQubits.size(); ++i) {
     std::tie(circuit.dataQubits[i], bits[i]) =
