@@ -67,6 +67,17 @@ using namespace mlir;
 using namespace mlir::qco;
 using namespace mlir::utils;
 
+// Edit these to rerun the mapping pass below with different
+// `MappingPassOptions` (see Passes.td for the meaning of each field).
+namespace {
+constexpr std::size_t kNLookahead = 1;
+constexpr float kAlpha = 1.0F;
+constexpr float kLambda = 0.5F;
+constexpr std::size_t kNIterations = 1;
+constexpr std::size_t kNTrials = 1;
+constexpr std::size_t kSeed = 42;
+} // namespace
+
 static SmallVector<Value> getQubitValues(ValueRange values) {
   return to_vector(llvm::make_filter_range(
       values, [](Value value) { return isa<QubitType>(value.getType()); }));
@@ -574,7 +585,12 @@ TEST_F(RydbergIonMappingPassFixture, MapBaconShorCodeOnRydbergIonTarget) {
   // on this target (see getRydbergIonTarget), so no decomposition pass runs
   // here at all.
   const std::string qubitTypeLabels = std::string(9, 'B') + std::string(3, 'A');
-  const MappingPassOptions options{.ntrials = 1,
+  const MappingPassOptions options{.nlookahead = kNLookahead,
+                                   .alpha = kAlpha,
+                                   .lambda = kLambda,
+                                   .niterations = kNIterations,
+                                   .ntrials = kNTrials,
+                                   .seed = kSeed,
                                    .qubitTypeLabels = qubitTypeLabels};
   ASSERT_TRUE(runPass(m.get(), target, options).succeeded());
   ASSERT_TRUE(succeeded(verify(*m)));
@@ -624,8 +640,14 @@ TEST_F(RydbergIonMappingPassFixture,
 
   // Leaving `qubitTypeLabels` unset (the default) must still compile the
   // same circuit successfully, reproducing the pass's previous behavior.
-  ASSERT_TRUE(
-      runPass(m.get(), target, MappingPassOptions{.ntrials = 1}).succeeded());
+  ASSERT_TRUE(runPass(m.get(), target,
+                      MappingPassOptions{.nlookahead = kNLookahead,
+                                         .alpha = kAlpha,
+                                         .lambda = kLambda,
+                                         .niterations = kNIterations,
+                                         .ntrials = kNTrials,
+                                         .seed = kSeed})
+                  .succeeded());
   ASSERT_TRUE(succeeded(verify(*m)));
   EXPECT_TRUE(isExecutable(getEntryPoint(m.get()), target));
 }
