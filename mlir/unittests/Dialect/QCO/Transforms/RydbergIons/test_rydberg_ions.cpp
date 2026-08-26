@@ -198,6 +198,14 @@ static bool isExecutable(func::FuncOp entry, const CompilerTarget& target) {
 ///
 /// Couplings: 0<>1, 1<>2, 2<>3, 2<>4, 3<>4, 4<>5, 5<>6, 5<>7, 6<>7, 7<>8,
 /// 8<>9, 8<>10, 9<>10, 10<>11.
+///
+/// Each triangular zone needs all three of its pairwise couplings so that its
+/// native CCX/CCZ can address any qubit as the odd one out, but only two of
+/// those three edges are true nearest-neighbour connections: the zone's
+/// "closing" edge ({2,4}, {5,7}, {8,10}) is a next-nearest-neighbour
+/// connection that is, physically, substantially more expensive to traverse
+/// with an ordinary SWAP. `MapBaconShorCodeOnRydbergIonTarget` below opts
+/// into the `nnn-edges` cost heuristic to model this.
 static CompilerTarget getRydbergIonTarget() {
   constexpr size_t numQubits = 12;
   const std::vector<CompilerTarget::Coupling> couplings{
@@ -546,7 +554,9 @@ dumpRoutedProgram(llvm::raw_ostream& os, ModuleOp m,
      << " seed=" << options.seed << " qubitTypeLabels=\""
      << (options.qubitTypeLabels.empty() ? "<default>"
                                          : options.qubitTypeLabels)
-     << "\"\n\n"
+     << "\" nnnEdges=\""
+     << (options.nnnEdges.empty() ? "<default>" : options.nnnEdges)
+     << "\" nnnCostMultiplier=" << options.nnnCostMultiplier << "\n\n"
      << "--- routed program (gates + inserted qco.swap ops) ---\n";
   m.print(os);
   os << "\n\n--- program qubit -> physical site (initial -> final) ---\n";
@@ -585,13 +595,22 @@ TEST_F(RydbergIonMappingPassFixture, MapBaconShorCodeOnRydbergIonTarget) {
   // on this target (see getRydbergIonTarget), so no decomposition pass runs
   // here at all.
   const std::string qubitTypeLabels = std::string(9, 'B') + std::string(3, 'A');
+
+  // The three triangular native-gate zones' "closing" edges ({2,4}, {5,7},
+  // {8,10}) complete the clique of couplings each zone needs for its native
+  // CCX/CCZ, but are, physically, substantially more expensive to use as an
+  // ordinary two-qubit SWAP than the zone's other two edges (see
+  // `getRydbergIonTarget`'s doc comment). Model that with the opt-in
+  // `nnn-edges` heuristic, at its default cost multiplier.
+  const std::string nnnEdges = "2-4,5-7,8-10";
   const MappingPassOptions options{.nlookahead = kNLookahead,
                                    .alpha = kAlpha,
                                    .lambda = kLambda,
                                    .niterations = kNIterations,
                                    .ntrials = kNTrials,
                                    .seed = kSeed,
-                                   .qubitTypeLabels = qubitTypeLabels};
+                                   .qubitTypeLabels = qubitTypeLabels,
+                                   .nnnEdges = nnnEdges};
   ASSERT_TRUE(runPass(m.get(), target, options).succeeded());
   ASSERT_TRUE(succeeded(verify(*m)));
 
