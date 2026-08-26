@@ -70,7 +70,7 @@ using namespace mlir::utils;
 // Edit these to rerun the mapping pass below with different
 // `MappingPassOptions` (see Passes.td for the meaning of each field).
 namespace {
-constexpr std::size_t kNLookahead = 1;
+constexpr std::size_t kNLookahead = 5;
 constexpr float kAlpha = 1.0F;
 constexpr float kLambda = 0.5F;
 constexpr std::size_t kNIterations = 1;
