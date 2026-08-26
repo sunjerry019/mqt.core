@@ -1917,6 +1917,227 @@ TEST_F(MappingPassFixture, InvalidQubitTypeLabelsFailsThePass) {
               MappingPassOptions{.ntrials = 1, .qubitTypeLabels = "AXB"})));
 }
 
+/// Return the target sites of the single `SWAPOp` remaining in `m`'s entry
+/// point, obtained by tracking each qubit's *site* identity (not its program
+/// identity) forward through `StaticOp`/`UnitaryOpInterface`, the same way
+/// `getCtrlOpsSites` (below) tracks sites for native multi-qubit gates: a
+/// `SWAPOp`'s outputs keep the same site as their correspondingly indexed
+/// inputs, so the generic `UnitaryOpInterface` branch handles it without a
+/// special case. Fails the current test (via `EXPECT_EQ`) if there is not
+/// exactly one `SWAPOp`.
+static std::pair<CompilerTarget::SiteId, CompilerTarget::SiteId>
+getSingleSwapSites(ModuleOp m) {
+  DenseMap<Value, CompilerTarget::SiteId> siteOf;
+  SmallVector<SWAPOp> swaps;
+  for (Operation& opRef : getEntryPoint(m).getFunctionBody().front()) {
+    Operation* op = &opRef;
+    if (auto staticOp = dyn_cast<StaticOp>(op)) {
+      siteOf.try_emplace(staticOp.getQubit(), staticOp.getIndex());
+      continue;
+    }
+    if (auto unitaryOp = dyn_cast<UnitaryOpInterface>(op)) {
+      for (const auto [pred, succ] : llvm::zip_equal(
+               unitaryOp.getInputQubits(), unitaryOp.getOutputQubits())) {
+        siteOf.try_emplace(succ, siteOf.at(pred));
+      }
+      if (auto s = dyn_cast<SWAPOp>(op)) {
+        swaps.push_back(s);
+      }
+      continue;
+    }
+    if (auto resetOp = dyn_cast<ResetOp>(op)) {
+      siteOf.try_emplace(resetOp.getQubitOut(),
+                         siteOf.at(resetOp.getQubitIn()));
+      continue;
+    }
+    if (auto measOp = dyn_cast<MeasureOp>(op)) {
+      siteOf.try_emplace(measOp.getQubitOut(), siteOf.at(measOp.getQubitIn()));
+    }
+  }
+
+  EXPECT_EQ(swaps.size(), 1UL);
+  if (swaps.size() != 1) {
+    return {-1, -1};
+  }
+  SWAPOp swapOp = swaps.front();
+  return {siteOf.at(swapOp.getQubit0In()), siteOf.at(swapOp.getQubit1In())};
+}
+
+TEST_F(MappingPassFixture, NnnEdgeCostChangesRoutingChoice) {
+  // Same triangle scenario as `StatefulSwapLabelsChangeRoutingChoice`: a
+  // 3-node path target routing CX(q0,q1), CX(q1,q2), CX(q0,q2). At seed 1,
+  // exactly one SWAP is needed, and (at the point it is inserted) the two
+  // candidate SWAPs -- on hardware edge (0,1) or on hardware edge (1,2) --
+  // tie under the plain graph-distance heuristic (this is the same tie that
+  // `StatefulSwapLabelsPreferCheaperTypedSwap` breaks using type labels).
+  // Naming one of these edges in `nnn-edges` with a multiplier greater than
+  // 1 must break the tie toward the other, untouched edge instead.
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    std::tie(qubits[1], qubits[2]) = builder.cx(qubits[1], qubits[2]);
+    std::tie(qubits[0], qubits[2]) = builder.cx(qubits[0], qubits[2]);
+
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+
+    return builder.finalize(bits);
+  };
+
+  auto moduleA = makeModule();
+  ASSERT_TRUE(runPass(moduleA.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .nnnEdges = "0-1",
+                                         .nnnCostMultiplier = 3.0F})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleA)));
+  EXPECT_TRUE(isExecutable(getEntryPoint(moduleA.get()), target));
+
+  auto moduleB = makeModule();
+  ASSERT_TRUE(runPass(moduleB.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .nnnEdges = "1-2",
+                                         .nnnCostMultiplier = 3.0F})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleB)));
+  EXPECT_TRUE(isExecutable(getEntryPoint(moduleB.get()), target));
+
+  const auto sitesA = getSingleSwapSites(moduleA.get());
+  const auto sitesB = getSingleSwapSites(moduleB.get());
+
+  const auto isEdge = [](const auto& sites, int64_t a, int64_t b) {
+    return (sites.first == a && sites.second == b) ||
+           (sites.first == b && sites.second == a);
+  };
+
+  EXPECT_TRUE(isEdge(sitesA, 1, 2))
+      << "expected the SWAP to avoid the named-expensive edge (0,1) and use "
+         "(1,2) instead";
+  EXPECT_TRUE(isEdge(sitesB, 0, 1))
+      << "expected the SWAP to avoid the named-expensive edge (1,2) and use "
+         "(0,1) instead";
+}
+
+TEST_F(MappingPassFixture, NnnEdgeCostComposesWithTypedCost) {
+  // Same triangle scenario. With labels "BAA" alone (as established by
+  // `StatefulSwapLabelsPreferCheaperTypedSwap`), the SWAP prefers the A<>A
+  // pair (cost 1) over any pair touching the sole "B" (cost >= 2). Naming
+  // *that* A<>A pair's hardware edge in `nnn-edges` with a large enough
+  // multiplier must make the combined cost
+  // (typedSwapCost * nnn-cost-multiplier) exceed the A<>B alternative's
+  // flat cost, flipping the choice back to a pair touching program qubit 0.
+  // This proves the two heuristics genuinely multiply together rather than
+  // one silently overriding or being ignored when both are set.
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    std::tie(qubits[1], qubits[2]) = builder.cx(qubits[1], qubits[2]);
+    std::tie(qubits[0], qubits[2]) = builder.cx(qubits[0], qubits[2]);
+
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+
+    return builder.finalize(bits);
+  };
+
+  auto moduleBaseline = makeModule();
+  ASSERT_TRUE(runPass(moduleBaseline.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .qubitTypeLabels = "BAA"})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleBaseline)));
+  const auto baselineSites = getSingleSwapSites(moduleBaseline.get());
+
+  const auto lo = std::min(baselineSites.first, baselineSites.second);
+  const auto hi = std::max(baselineSites.first, baselineSites.second);
+  const std::string edgeSpec = std::to_string(lo) + "-" + std::to_string(hi);
+
+  auto moduleComposed = makeModule();
+  ASSERT_TRUE(runPass(moduleComposed.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .qubitTypeLabels = "BAA",
+                                         .nnnEdges = edgeSpec,
+                                         .nnnCostMultiplier = 5.0F})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleComposed)));
+  EXPECT_TRUE(isExecutable(getEntryPoint(moduleComposed.get()), target));
+
+  const auto composedSites = getSingleSwapSites(moduleComposed.get());
+  EXPECT_NE(composedSites, baselineSites)
+      << "expected the combined type*edge cost to flip the SWAP choice away "
+         "from the edge used when only qubit-type-labels was set";
+}
+
+TEST_F(MappingPassFixture, InvalidNnnEdgesSpecFailsThePass) {
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+    return builder.finalize(bits);
+  };
+
+  {
+    // Unparsable syntax.
+    auto m = makeModule();
+    EXPECT_TRUE(failed(
+        runPass(m.get(), target,
+                MappingPassOptions{.ntrials = 1, .nnnEdges = "not-a-number"})));
+  }
+  {
+    // Syntactically valid, but 0 and 2 are not adjacent on this target.
+    auto m = makeModule();
+    EXPECT_TRUE(failed(runPass(
+        m.get(), target, MappingPassOptions{.ntrials = 1, .nnnEdges = "0-2"})));
+  }
+}
+
 /// Return the physical sites of every native multi-qubit `CtrlOp` remaining
 /// in `m`'s entry point, in program order, by tracking each qubit's site as
 /// it flows forward through

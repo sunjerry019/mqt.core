@@ -18,6 +18,11 @@ releases may include breaking changes.
   `CompilerTarget` explicitly declares the operation; every target that does not
   declare it keeps the pass's prior decomposition-required behavior ([#????])
   ([**@sunjerry019**])
+- ✨ Add an opt-in NN/NNN edge-cost heuristic to the MLIR mapping pass, letting
+  an `nnn-edges` option name coupling edges that are physically more expensive
+  to use, multiplying their SWAP cost by a tunable `nnn-cost-multiplier`
+  (default `3.0`) during routing; composes multiplicatively with the existing
+  `qubit-type-labels` heuristic ([#????]) ([**@sunjerry019**])
 - ✨ Add an opt-in stateful A/B swap heuristic to the MLIR mapping pass, letting
   a `qubit-type-labels` option assign auxiliary/data roles to program qubits
   that make SWAP costs type-dependent (A<>A=1, A<>B=2, B<>B=3) during routing

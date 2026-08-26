@@ -192,28 +192,41 @@ private:
     /// Whether the stateful A/B swap heuristic is opted into for this
     /// search. Copied down from the root node.
     bool useTypedCost;
+    /// Whether the NN/NNN edge-cost heuristic is opted into for this
+    /// search. Copied down from the root node.
+    bool useEdgeCost;
     float f;
 
     /// Construct a root node with the given layout. Initialize the
     /// sequence with an empty vector and set the cost to zero.
-    Node(Layout layout, const bool useTypedCost)
+    Node(Layout layout, const bool useTypedCost, const bool useEdgeCost)
         : layout(std::move(layout)), parent(nullptr), depth(0), pathCost(0),
-          useTypedCost(useTypedCost), f(0) {}
+          useTypedCost(useTypedCost), useEdgeCost(useEdgeCost), f(0) {}
 
     /// Construct a non-root node from its parent node. Apply the given swap to
     /// the layout of the parent node. If the stateful A/B swap heuristic is
     /// enabled, `qubitLabels` (indexed by program qubit) determines the
-    /// type-dependent cost contributed by this SWAP.
+    /// type-dependent cost contributed by this SWAP. If the NN/NNN edge-cost
+    /// heuristic is enabled, a SWAP whose hardware edge is contained in
+    /// `nnnEdges` has its cost multiplied by `nnnCostMultiplier`.
     Node(Node* parent, const IndexPairType& swap, const Window& window,
          const CompilerTarget& target, const Parameters& params,
-         ArrayRef<QubitLabel> qubitLabels)
+         ArrayRef<QubitLabel> qubitLabels,
+         const DenseSet<IndexPairType>& nnnEdges, const float nnnCostMultiplier)
         : layout(parent->layout), swap(swap), parent(parent),
           depth(parent->depth + 1), pathCost(parent->pathCost),
-          useTypedCost(parent->useTypedCost), f(0) {
-      if (useTypedCost) {
-        const auto [prog0, prog1] =
-            layout.getProgramIndices(swap.first, swap.second);
-        pathCost += typedSwapCost(qubitLabels[prog0], qubitLabels[prog1]);
+          useTypedCost(parent->useTypedCost), useEdgeCost(parent->useEdgeCost),
+          f(0) {
+      if (useTypedCost || useEdgeCost) {
+        float base = 1.0F;
+        if (useTypedCost) {
+          const auto [prog0, prog1] =
+              layout.getProgramIndices(swap.first, swap.second);
+          base = typedSwapCost(qubitLabels[prog0], qubitLabels[prog1]);
+        }
+        const float edgeMultiplier =
+            (useEdgeCost && nnnEdges.contains(swap)) ? nnnCostMultiplier : 1.0F;
+        pathCost += base * edgeMultiplier;
       }
       layout.swap(swap.first, swap.second);
       f = g(params.alpha) + h(window, target, params); // NOLINT
@@ -240,10 +253,13 @@ private:
   private:
     /// Calculate the path cost for the A* search algorithm.
     /// The path costs are the weighted sum of the currently required SWAPs.
-    /// If the stateful A/B swap heuristic is enabled, the flat per-SWAP cost
-    /// is replaced by the type-dependent cost accumulated in `pathCost`.
+    /// If the stateful A/B swap heuristic or the NN/NNN edge-cost heuristic
+    /// is enabled, the flat per-SWAP cost is replaced by the cost
+    /// accumulated in `pathCost`.
     [[nodiscard]] float g(const float alpha) const {
-      return alpha * (useTypedCost ? pathCost : static_cast<float>(depth));
+      return alpha * ((useTypedCost || useEdgeCost)
+                          ? pathCost
+                          : static_cast<float>(depth));
     }
 
     /// Return the type-dependent cost of a SWAP between two program qubits
@@ -376,6 +392,7 @@ protected:
     assert(alpha > 0 && "expected alpha > 0");
     assert(niterations > 0 && "expected niterations > 0");
     assert(ntrials > 0 && "expected ntrials > 0");
+    assert(nnnCostMultiplier > 0 && "expected nnn-cost-multiplier > 0");
 
     if (!target) {
       llvm::reportFatalUsageError("No compiler target specified!");
@@ -402,6 +419,17 @@ protected:
       return;
     }
     qubitLabels = std::move(*parsedLabels);
+
+    auto parsedNnnEdges = parseNnnEdges(nnnEdges.getValue(), *target);
+    if (failed(parsedNnnEdges)) {
+      func.emitError() << "invalid nnn-edges option '" << nnnEdges.getValue()
+                       << "': expected a comma-separated list of "
+                          "'siteA-siteB' pairs naming existing coupling "
+                          "edges of the target";
+      signalPassFailure();
+      return;
+    }
+    nnnEdgeSet = std::move(*parsedNnnEdges);
 
     auto comp = discoverComputation(func);
     if (failed(comp)) {
@@ -482,6 +510,54 @@ private:
       }
     }
     return labels;
+  }
+
+  /// Parse the `nnnEdges` option into a set of canonicalized (min, max)
+  /// hardware-vertex pairs, opting into the NN/NNN edge-cost heuristic.
+  /// `spec` is a comma-separated list of non-empty `siteA-siteB` tokens,
+  /// using the target's own site identifiers. Each site identifier must
+  /// resolve to a vertex of `target`, and each resolved pair must already be
+  /// a coupling edge of `target`. Returns failure otherwise. Returns an
+  /// empty set (disabling the heuristic) if `spec` is empty.
+  [[nodiscard]] static FailureOr<DenseSet<IndexPairType>>
+  parseNnnEdges(StringRef spec, const CompilerTarget& target) {
+    DenseSet<IndexPairType> edges;
+    if (spec.empty()) {
+      return edges;
+    }
+
+    SmallVector<StringRef> tokens;
+    spec.split(tokens, ',');
+    for (const StringRef token : tokens) {
+      if (token.empty()) {
+        return failure();
+      }
+
+      SmallVector<StringRef, 2> parts;
+      token.split(parts, '-');
+      if (parts.size() != 2) {
+        return failure();
+      }
+
+      CompilerTarget::SiteId siteA{};
+      CompilerTarget::SiteId siteB{};
+      if (parts[0].getAsInteger(10, siteA) ||
+          parts[1].getAsInteger(10, siteB)) {
+        return failure();
+      }
+
+      const auto vertexA = target.vertexForSite(siteA);
+      const auto vertexB = target.vertexForSite(siteB);
+      if (!vertexA || !vertexB) {
+        return failure();
+      }
+      if (!target.areAdjacent(*vertexA, *vertexB)) {
+        return failure();
+      }
+
+      edges.insert(std::minmax(*vertexA, *vertexB));
+    }
+    return edges;
   }
 
   /// Return the qubit values in `values`, preserving their relative order.
@@ -1026,8 +1102,8 @@ private:
         frontier;
 
     // Early exit, if the root node is a goal node already.
-    Node* root =
-        std::construct_at(arena.Allocate(), layout, !qubitLabels.empty());
+    Node* root = std::construct_at(arena.Allocate(), layout,
+                                   !qubitLabels.empty(), !nnnEdgeSet.empty());
     if (root->isGoal(window.front(), *target)) {
       return SmallVector<IndexPairType>{};
     }
@@ -1087,9 +1163,9 @@ private:
           }
           expansionSet.push_back(swap);
 
-          frontier.emplace(std::construct_at(arena.Allocate(), curr, swap,
-                                             window, *target, params,
-                                             ArrayRef(qubitLabels)));
+          frontier.emplace(std::construct_at(
+              arena.Allocate(), curr, swap, window, *target, params,
+              ArrayRef(qubitLabels), nnnEdgeSet, nnnCostMultiplier));
         });
       }
 
@@ -1774,6 +1850,14 @@ private:
   /// heuristic, parsed from `qubitTypeLabels` at the start of
   /// `runOnOperation`. Empty when the heuristic is disabled.
   SmallVector<QubitLabel> qubitLabels;
+
+  /// Canonicalized (min, max) hardware-vertex edges for the opt-in NN/NNN
+  /// edge-cost heuristic, parsed from the `nnnEdges` option at the start of
+  /// `runOnOperation`. Named distinctly from the `nnnEdges` option field
+  /// (inherited from `MappingPassBase`) to avoid shadowing it, mirroring how
+  /// `qubitLabels` is named distinctly from the `qubitTypeLabels` option
+  /// field. Empty when the heuristic is disabled.
+  DenseSet<IndexPairType> nnnEdgeSet;
 };
 
 } // namespace

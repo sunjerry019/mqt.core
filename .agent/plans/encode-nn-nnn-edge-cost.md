@@ -71,12 +71,43 @@ this directly, the same way the existing `StatefulSwap*` tests demonstrate the
 
 ## Progress
 
-- [ ] Not yet started. This ExecPlan was authored from a design discussion and
-      has not had any of its `Plan of Work` steps implemented yet.
+- [x] `Passes.td`: added `nnn-edges` and `nnn-cost-multiplier` options and the
+      combined-cost-formula description paragraph.
+- [x] `Mapping.cpp`: added `parseNnnEdges`, the `nnnEdgeSet` member, wired
+      parsing into `runOnOperation`, extended `Node` with `useEdgeCost` and the
+      edge-multiplier cost accumulation, and updated `search()`'s root and child
+      `Node` construction call sites.
+- [x] `test_mapping.cpp`: added `NnnEdgeCostChangesRoutingChoice`,
+      `NnnEdgeCostComposesWithTypedCost`, and `InvalidNnnEdgesSpecFailsThePass`.
+- [x] `CHANGELOG.md`: added an `### Added` entry (PR reference left as `[#????]`
+      pending an actual PR).
+- [x] Full validation: focused mapping suite (87/87), full `ctest` suite
+      (4598/4598, 2 pre-existing unrelated skips), and `prek` hooks scoped to
+      the changed files all pass. The repo-wide `nox -s lint` session itself
+      fails in this environment on an unrelated, pre-existing issue (the
+      `bibtex-tidy` hook requires `node`, which is not installed here); this is
+      independent of this change and was confirmed by running `prek` directly,
+      scoped to the files this plan touched.
 
 ## Surprises & Discoveries
 
-None yet; this section will be filled in as implementation proceeds.
+- Naming collision: the plan's Interfaces and Dependencies section named both
+  the TableGen option field (`nnnEdges`, inherited from `MappingPassBase`) and
+  the parsed-edge-set private member `nnnEdges`. Since `MappingPass` derives
+  from `MappingPassBase<MappingPass>`, a same-named derived-class member would
+  shadow the inherited `mlir::Pass::Option<std::string>`, making unqualified
+  `nnnEdges` inside `MappingPass` resolve to the wrong one (breaking
+  `nnnEdges.getValue()`). Fixed by naming the private member `nnnEdgeSet`
+  instead, mirroring how `qubitTypeLabels` (option) and `qubitLabels` (parsed
+  member) are already deliberately named differently for the same reason.
+  Everywhere else, the plan's exact design (cost formula, parsing rules,
+  constructor signatures, call sites) matched the implementation without further
+  changes.
+- The two hand-derived test scenarios worked on the first try: the tie-break
+  scenario reused from `StatefulSwapLabelsPreferCheaperTypedSwap` (a 3-node path
+  target, triangle CX program, seed 1) behaved exactly as predicted once
+  `nnn-edges` targeted one of the two tied candidate SWAP edges, requiring no
+  empirical trial-and-error adjustment of the topology or seed.
 
 ## Decision Log
 
@@ -122,7 +153,19 @@ None yet; this section will be filled in as implementation proceeds.
 
 ## Outcomes & Retrospective
 
-Not yet started; to be completed once implementation is done.
+Implemented as designed, with one deviation from the Interfaces and Dependencies
+section: the private parsed-edge-set member is named `nnnEdgeSet`, not
+`nnnEdges`, to avoid shadowing the TableGen-generated `nnnEdges` option field
+(see Surprises & Discoveries). Every other detail (option names and defaults,
+cost formula, `Node` field/constructor changes, `parseNnnEdges`'s parsing and
+validation rules, and the `search()` call-site changes) matches the plan
+exactly. All three new tests passed on the first build without needing to adjust
+the topology, program, or seed values empirically. The `qubit-type-labels`
+heuristic and the new `nnn-edges` heuristic were confirmed to compose
+multiplicatively (`NnnEdgeCostComposesWithTypedCost`), and the
+opt-in/default-preserving requirement was confirmed by the full pre-existing
+test suite (`ctest`) passing unmodified with the new options left at their
+defaults.
 
 ## Context and Orientation
 
@@ -474,10 +517,11 @@ generating `MappingPassOptions::nnnEdges` (default `""`),
 `MappingPassBase` members. New private members on the anonymous-namespace
 `MappingPass` class in `mlir/lib/Dialect/QCO/Transforms/Mapping/Mapping.cpp`:
 `static FailureOr<DenseSet<IndexPairType>> parseNnnEdges(StringRef, const CompilerTarget&)`
-and `DenseSet<IndexPairType> nnnEdges;`. Extended nested `Node` struct: new
-field `bool useEdgeCost`; root constructor becomes
-`Node(Layout, bool useTypedCost, bool useEdgeCost)`; non-root constructor gains
-two trailing parameters,
+and `DenseSet<IndexPairType> nnnEdgeSet;` (named distinctly from the inherited
+`nnnEdges` option field to avoid shadowing it; see Surprises & Discoveries).
+Extended nested `Node` struct: new field `bool useEdgeCost`; root constructor
+becomes `Node(Layout, bool useTypedCost, bool useEdgeCost)`; non-root
+constructor gains two trailing parameters,
 `const DenseSet<IndexPairType>& nnnEdges, float nnnCostMultiplier`. No changes
 to `mlir/include/mlir/Dialect/QCO/Transforms/Mapping/Mapping.h` (the
 `createMappingPass(const CompilerTarget&, MappingPassOptions)` factory signature

@@ -170,31 +170,62 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
     first. This pass does not translate between different native multi-qubit gates of the same arity (for example,
     rewriting a Toffoli into an equivalent Hadamard-conjugated doubly-controlled-Z when only the latter is declared
     native); any such gate-basis translation must happen in an earlier pipeline stage.
+
+    The pass optionally supports a per-edge cost heuristic, opted into via the `nnn-edges` option. Some targets have
+    coupling-graph edges that are direct connections in the target's topology description but are, physically,
+    substantially more expensive to use than other edges (e.g. a "next-nearest-neighbour" edge on a target whose
+    connectivity is mostly "nearest-neighbour"). `nnn-edges` names such edges as a comma-separated list of
+    `siteA-siteB` pairs, using the target's own site identifiers (e.g. `2-4,5-7,8-10`); each named pair must already
+    be a coupling edge of the target. When `nnn-edges` is non-empty, every SWAP on the path from the root to a search
+    node `n` that uses a named edge has its cost multiplied by `nnn-cost-multiplier` (default `3.0`), on top of
+    whatever cost `qubit-type-labels` would otherwise assign it (or on top of a flat cost of `1` if
+    `qubit-type-labels` is unset):
+
+    `cost(edge, labels) = (qubit-type-labels set ? typedSwapCost(labels) : 1) * (edge in nnn-edges ? nnn-cost-multiplier : 1)`
+
+    `h(n)` is unaffected. The heuristic is opt-in and disabled by default (an empty `nnn-edges`), preserving the
+    default routing behavior regardless of `nnn-cost-multiplier` or `qubit-type-labels`.
   }];
-  let options = [Option<"nlookahead", "nlookahead", "std::size_t", "1",
-                        "The number of lookahead steps.">,
-                 Option<"alpha", "alpha", "float", "1.0F",
-                        "The alpha factor in the cost function. Must be > 0.">,
-                 Option<"lambda", "lambda", "float", "0.5F",
-                        "The lambda factor in the cost function.">,
-                 Option<"niterations", "niterations", "std::size_t", "1",
-                        "The number of forwards and backwards traversal to "
-                        "improve the initial layout. Must be > 0.">,
-                 Option<"ntrials", "ntrials", "std::size_t", "4",
-                        "The number of (possibly parallel) random trials of "
-                        "the forwards and backwards mechanism. Must be > 0.">,
-                 Option<"seed", "seed", "std::size_t", "42",
-                        "A seed used for randomization.">,
-                 Option<"qubitTypeLabels", "qubit-type-labels", "std::string",
-                        "\"\"",
-                        "Opt-in per-program-qubit A/B type labels for the "
-                        "stateful swap heuristic, e.g. 'AABB' labels program "
-                        "qubits 0 and 1 as A (auxiliary) and qubits 2 and 3 "
-                        "as B (data). Unlabeled trailing qubits default to "
-                        "B. When non-empty, SWAP costs become "
-                        "type-dependent (A<>A = 1, A<>B = 2, B<>B = 3) "
-                        "instead of a flat per-SWAP cost. Empty (the "
-                        "default) disables the heuristic.">];
+  let options =
+      [Option<"nlookahead", "nlookahead", "std::size_t", "1",
+              "The number of lookahead steps.">,
+       Option<"alpha", "alpha", "float", "1.0F",
+              "The alpha factor in the cost function. Must be > 0.">,
+       Option<"lambda", "lambda", "float", "0.5F",
+              "The lambda factor in the cost function.">,
+       Option<"niterations", "niterations", "std::size_t", "1",
+              "The number of forwards and backwards traversal to "
+              "improve the initial layout. Must be > 0.">,
+       Option<"ntrials", "ntrials", "std::size_t", "4",
+              "The number of (possibly parallel) random trials of "
+              "the forwards and backwards mechanism. Must be > 0.">,
+       Option<"seed", "seed", "std::size_t", "42",
+              "A seed used for randomization.">,
+       Option<"qubitTypeLabels", "qubit-type-labels", "std::string", "\"\"",
+              "Opt-in per-program-qubit A/B type labels for the "
+              "stateful swap heuristic, e.g. 'AABB' labels program "
+              "qubits 0 and 1 as A (auxiliary) and qubits 2 and 3 "
+              "as B (data). Unlabeled trailing qubits default to "
+              "B. When non-empty, SWAP costs become "
+              "type-dependent (A<>A = 1, A<>B = 2, B<>B = 3) "
+              "instead of a flat per-SWAP cost. Empty (the "
+              "default) disables the heuristic.">,
+       Option<"nnnEdges", "nnn-edges", "std::string", "\"\"",
+              "Opt-in comma-separated list of 'siteA-siteB' "
+              "coupling edges (using the target's own site "
+              "identifiers) that should be treated as more "
+              "expensive, e.g. '2-4,5-7,8-10'. Each named pair "
+              "must already be a coupling edge of the target. "
+              "When non-empty, a SWAP on one of these edges has "
+              "its cost multiplied by nnn-cost-multiplier, on "
+              "top of whatever cost qubit-type-labels would "
+              "otherwise assign it (or on top of the flat cost "
+              "of 1 if qubit-type-labels is unset). Empty (the "
+              "default) disables the heuristic.">,
+       Option<"nnnCostMultiplier", "nnn-cost-multiplier", "float", "3.0F",
+              "The multiplicative cost penalty applied to a SWAP "
+              "whose edge is named in nnn-edges. Must be > 0. "
+              "Only observable when nnn-edges is non-empty.">];
   let statistics = [Statistic<"numSwaps", "num-inserted-swaps",
                               "The number of inserted SWAPs">];
 }
