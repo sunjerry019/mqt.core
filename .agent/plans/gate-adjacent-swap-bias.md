@@ -1,4 +1,4 @@
-# Bias the mapping pass toward SWAPs that immediately follow a gate on the same qubit pair
+# Prefer SWAPs that immediately follow a two-qubit gate on the same qubit pair
 
 This ExecPlan is a living document. The sections `Progress`,
 `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must
@@ -7,51 +7,58 @@ be kept up to date as work proceeds.
 This ExecPlan must be maintained in accordance with `.agent/PLANS.md` from the
 repository root.
 
-**This plan must not be started until
-`.agent/plans/gate-adjacent-swap-statistic.md` has been implemented and its
-measurement recorded.** That plan adds the counting machinery and the statistic
-this plan depends on, and it produces the baseline number without which this
-plan's effect cannot be judged. If that measurement showed the opportunity to be
-negligible, read `Decision Log` below before proceeding: abandoning this plan is
-an acceptable outcome.
+This plan supersedes an earlier plan
+`.agent/plans/gate-adjacent-swap-statistic.md`, which covered only the
+measurement half of this work. That file carries a superseded notice and must
+not be implemented separately; everything in it is incorporated here as
+Milestone 1.
 
 ## Purpose / Big Picture
 
-When the compiler inserts a SWAP operation, that SWAP may later have to be built
-in an expensive protected form, which on this hardware costs roughly seven and a
-half times what the cheap unprotected form costs. Whether a given SWAP needs
-that protection is decided outside the compiler, by a simulator.
+When the compiler inserts a SWAP operation into a quantum circuit, that SWAP
+must later be built either in a cheap unprotected form or in an expensive
+protected form that stops a single fault from spreading into an error the code
+cannot correct. On this hardware the protected form costs roughly seven and a
+half times the unprotected one. Which SWAPs need protecting is decided outside
+this compiler, by a slow simulation in a separate project.
 
-There is one situation where it is known in advance that the protection is
-unnecessary: when the SWAP acts on exactly the pair of qubits that a two-qubit
+There is one situation where the answer is believed to be known in advance and
+for free. If a SWAP acts on exactly the same pair of qubits that a two-qubit
 gate of the original circuit has just acted on, with nothing in between touching
-either qubit. The companion plan named above added a statistic counting how
-often that happens. This plan makes the router *prefer* it, by telling the
-search that such a SWAP is cheaper than it otherwise looks.
+either qubit, then those two qubits were already interacting directly a moment
+earlier. The SWAP opens no path for a fault to spread that the gate had not
+already opened, so the original circuit's own fault tolerance covers it and the
+SWAP can stay cheap.
 
-After this change, a user can supply a discount factor, and the search will
-favour placements that produce these cheap SWAPs. The user-visible outcome is a
-routed circuit whose total expected error is lower, because a larger fraction of
-its SWAPs can be left unprotected.
+The compiler has no notion of this today and produces such SWAPs only by
+accident. This plan makes it produce them deliberately, by telling the search
+that they are cheaper than they look.
 
-You can see it working by routing the same circuit across many seeds with and
-without the discount and comparing the distribution of the
-`num-gate-adjacent-swaps` statistic: its mean must rise, and the mean total SWAP
-cost must not rise with it.
+The whole plan is built around the fact that its own payoff is uncertain. It
+therefore proceeds through four gates, each of which can stop the work with a
+recorded finding rather than a completed feature. The first gate costs nothing
+and runs entirely against data already on disk; the expensive parts happen only
+if it passes.
+
+You can see the finished work operating by routing the same circuit across many
+random seeds with and without the discount and comparing how many qualifying
+SWAPs appear: the average must rise, and the average total SWAP cost must not
+rise with it.
 
 ## Progress
 
-- [ ] Confirm `.agent/plans/gate-adjacent-swap-statistic.md` is implemented and
-      that its recorded baseline justifies continuing.
-- [ ] Read the orientation section and confirm the named code matches the
-      current working tree, in particular the claim that the search early-exits
-      when the front layer is already executable.
-- [ ] Add the pass option.
-- [ ] Thread the qualifying-pair set into the search node cost.
-- [ ] Add the two GoogleTests described under Validation and Acceptance.
-- [ ] Measure the effect over at least thirty seeds at several discount values
-      and record it in `Outcomes & Retrospective`, including the case where it
-      does not help.
+- [ ] **Gate 0.** Test the premise against existing data: confirm that the SWAPs
+      which already qualify were in fact left unprotected by the simulator.
+      Record the finding and the estimated ceiling on benefit.
+- [ ] **Gate 1.** Add the per-site gate tracking, the qualifying predicate and
+      the statistic. No routing decision changes.
+- [ ] Confirm routed output is unaffected by Milestone 1.
+- [ ] **Gate 2.** Add the multi-seed measurement loop and record the baseline
+      distribution of the statistic.
+- [ ] **Gate 3.** Add the pass option, the activation flag and the discount.
+- [ ] Add the GoogleTests described under Validation and Acceptance.
+- [ ] **Gate 4.** Measure the effect across seeds at several discount values and
+      decide whether to keep the option. Record the decision either way.
 
 ## Surprises & Discoveries
 
@@ -67,37 +74,62 @@ cost must not rise with it.
   gate-then-SWAP ordering therefore needs to be handled, and only for the first
   SWAP of each search, because no gates execute during a search.
 
+- Observation: a first attempt at that scan produced zero everywhere because it
+  searched forward from each SWAP for a following gate, which as the previous
+  point explains can never find anything. The correct scan walks forward from
+  every two-qubit gate looking for a following SWAP, or equivalently backward
+  from every SWAP. Recording this because the same mistake is easy to repeat
+  when writing the Gate 0 script.
+
 - Observation: the discount is silently inert unless one of the two existing
   cost heuristics is already switched on, and the implementation must handle
   this explicitly rather than assume otherwise. Evidence: in the `Node`
-  constructor at `Mapping.cpp` approximately line 219, the whole cost
-  accumulation is wrapped in `if (useTypedCost || useEdgeCost) { ... }`, so with
-  neither heuristic active `pathCost` is never incremented; and `g()` at
-  approximately line 259 returns
+  constructor in `mlir/lib/Dialect/QCO/Transforms/Mapping/Mapping.cpp` at
+  approximately line 219, the whole cost accumulation is wrapped in
+  `if (useTypedCost || useEdgeCost) { ... }`, so with neither heuristic active
+  `pathCost` is never incremented; and `g()` at approximately line 259 returns
   `alpha * ((useTypedCost || useEdgeCost) ? pathCost : static_cast<float>(depth))`,
   so with neither active the search ranks purely by how many SWAPs deep a node
   is and ignores `pathCost` entirely. A discount written inside that guard
-  therefore does nothing at all in the default configuration. Either the
-  discount must join the predicate that decides whether weighted costs are in
-  use, or the pass must reject a discount other than one when neither existing
-  heuristic is set. This matters for the tests in particular: a test that
-  enables only the discount and expects a changed routing will fail for this
-  reason and the cause is not obvious.
+  therefore does nothing at all in the default configuration, and a test that
+  enables only the discount will fail for a reason that is not obvious from its
+  symptoms.
 
-- Observation: the opportunity is rare in the circuits measured so far, so the
-  value of this change is unproven. Evidence: the same scan found between two
-  and five qualifying SWAPs out of seventy-six to eighty-eight total. Whether
-  biasing the search increases that number materially is exactly what this
-  plan's measurement step exists to find out, and a negative result must be
-  recorded rather than tuned away.
+- Observation: the expected size of the benefit is small unless the discount
+  moves the count a long way. Arithmetic: a routing contains roughly eighty
+  SWAPs of which two to five qualify today, and roughly half of all SWAPs end up
+  protected. If the discount doubles the qualifying count to about six, that is
+  three extra SWAPs guaranteed unprotected, of which about one and a half would
+  otherwise have been protected, each saving about six and a half cost units
+  where a bare nearest-neighbour SWAP costs one. Against a total routing cost in
+  the high hundreds that is low single-digit percent. The change is worth
+  pursuing only if the count can be pushed substantially higher than double,
+  which is exactly what Gate 4 measures. Anyone running this should know the
+  shape of the answer before seeing it.
 
 ## Decision Log
 
-- Decision: implement this as a cost discount inside the search rather than as a
-  peephole rewrite applied after routing. Rationale: the goal is to change which
-  placements the router chooses, and a rewrite applied afterwards cannot do
-  that; it can only clean up placements that were already chosen for other
-  reasons. Date/Author: 2026-09-18, this plan.
+- Decision: merge the measurement and the behaviour change into one plan with
+  internal gates, rather than keeping them as two plans. Rationale: they share
+  all of their machinery, so splitting them duplicated the orientation material
+  and made the sequencing look like a technical dependency when it is a
+  methodological one. The gates preserve the property that mattered — that the
+  baseline is measured with the same instrument as the improvement, before the
+  improvement exists. Date/Author: 2026-09-21, this plan, at the user's
+  direction.
+
+- Decision: make a check against existing simulator output the first gate,
+  before any code is written. Rationale: the entire plan rests on the premise
+  that a gate-adjacent SWAP is safe to leave unprotected. That premise is
+  testable for free against routings and verdicts already on disk, and if it is
+  false the rest of the plan is worthless. Spending half an hour to find that
+  out first is obviously right. Date/Author: 2026-09-21, this plan.
+
+- Decision: implement the preference as a cost discount inside the search rather
+  than as a peephole rewrite applied after routing. Rationale: the goal is to
+  change which placements the router chooses, and a rewrite applied afterwards
+  cannot do that; it can only clean up placements that were already chosen for
+  other reasons. Date/Author: 2026-09-18, this plan.
 
 - Decision: apply the discount only to the first SWAP of each search invocation.
   Rationale: the qualifying condition refers to a gate that has already
@@ -106,58 +138,92 @@ cost must not rise with it.
   node alone, which the search's duplicate-state pruning requires. Date/Author:
   2026-09-18, this plan.
 
-- Decision: express the option as a multiplicative discount on the SWAP's cost
-  rather than as a boolean. Rationale: the correct discount depends on which
-  cost model is active and on hardware constants that are still being measured,
-  so a float lets the user calibrate it without another code change, and a value
-  of one disables the feature entirely. Date/Author: 2026-09-18, this plan.
+- Decision: define "nothing in between" to include single-qubit gates, so that a
+  Hadamard on either qubit between the gate and the SWAP disqualifies the pair.
+  Rationale: this is the conservative reading, it matches the definition the
+  hardware owner chose, and it matches the measurement quoted above; relaxing it
+  later is a safe direction whereas tightening it is not. Date/Author:
+  2026-09-18, this plan, at the user's explicit direction.
 
-- Decision: split the measurement out of this plan into
-  `.agent/plans/gate-adjacent-swap-statistic.md` and make this plan depend on
-  it. Rationale: shipping the instrument together with the change it is meant to
-  evaluate makes the baseline unobservable, and this plan's payoff is genuinely
-  uncertain, so the baseline is the deciding evidence. Date/Author: 2026-09-18,
-  this plan.
+- Decision: express the option as a multiplicative discount rather than a
+  boolean. Rationale: the correct discount depends on which cost model is active
+  and on hardware constants that are still being measured, so a float lets the
+  user calibrate it without another code change, and a value of one disables the
+  feature entirely. Date/Author: 2026-09-18, this plan.
 
-- Decision: abandoning this plan is an acceptable outcome. Rationale: if the
-  baseline measurement shows only a handful of qualifying SWAPs per routing and
-  the discount does not move that number, the change adds an option and a branch
-  on the search's hot path for no benefit, and the honest response is to record
-  that and stop. Whoever reaches that point must write the finding into
-  `Outcomes & Retrospective` rather than deleting the plan. Date/Author:
-  2026-09-18, this plan.
+- Decision: measure with the layout search limited to a single trial until
+  `.agent/plans/cost-weighted-trial-selection.md` has landed. Rationale: with
+  more than one trial the search minimises the discounted cost but the selection
+  among trials ranks candidates by raw SWAP count, so the selection step can
+  discard precisely the candidate the discount produced, masking the effect
+  being measured. The existing Rydberg-ion test already uses one trial, so this
+  costs nothing. Date/Author: 2026-09-21, this plan.
+
+- Decision: use a seed loop inside the existing GoogleTest as the measurement
+  instrument, rather than waiting for the command-line tool in
+  `.agent/plans/rydberg-ion-routing-tool.md`. Rationale: the measurement needs
+  many seeds in one process, which a loop inside one test body provides in a few
+  hours, whereas the tool is a larger extraction; the tool remains the better
+  long-term instrument and this plan does not compete with it. Date/Author:
+  2026-09-21, this plan, at the user's direction to prioritise this work.
+
+- Decision: abandoning this plan after any gate is an acceptable outcome.
+  Rationale: the payoff is genuinely uncertain and the change adds a branch to
+  the search's hot path, so if the evidence does not support it the honest
+  response is to record that and stop. Whoever reaches that point must write the
+  finding into `Outcomes & Retrospective` rather than deleting the plan.
+  Date/Author: 2026-09-18, this plan.
 
 ## Outcomes & Retrospective
 
-Not yet started. On completion, record the distribution of the
-`num-gate-adjacent-swaps` statistic and of the total SWAP cost across at least
-thirty seeds, with the discount disabled and at each discount value tried, and
-state plainly whether the bias increased the count and whether total cost fell.
+Not yet started.
+
+On completion of Gate 0, record how many qualifying SWAPs were found in each
+checked-in routing, how many of those the simulator left unprotected, whether
+the two available walk orders for the same routing agreed, and the estimated
+ceiling on benefit.
+
+On completion of Gate 2, record the distribution of the qualifying-SWAP count
+and of the total SWAP count across the measured seeds: mean, spread and range,
+not a single number.
+
+On completion of Gate 4, record the same distributions at each discount value
+tried, and state plainly whether the count rose, whether total cost fell, and
+whether the option should be kept.
 
 ## Context and Orientation
 
-Everything below is a fact about the repository as it stands. Verify it.
+Everything below is a fact about the repositories as they stand. Verify each
+claim before relying on it.
 
 Terms, in plain language. The *mapping pass* inserts SWAP operations into a
-quantum circuit so every multi-qubit gate acts on directly connected hardware
-sites. It is declared in `mlir/include/mlir/Dialect/QCO/Transforms/Passes.td` as
-`def MappingPass`, command-line name `place-and-route`, implemented as the
-single `MappingPass` struct in
-`mlir/lib/Dialect/QCO/Transforms/Mapping/Mapping.cpp`. A *site* is a hardware
-qubit position. A *program qubit* is a qubit of the user's circuit; which site
-holds which program qubit changes as SWAPs execute, and that assignment is the
-*layout*. A *fault-tolerant SWAP* is an expensive protected realisation; a
-*bare SWAP* is the cheap unprotected one. The pass never decides which is used;
-it only weighs how likely the expensive form is.
+quantum circuit so that every multi-qubit gate acts on hardware positions the
+machine directly connects. It is declared in
+`mlir/include/mlir/Dialect/QCO/Transforms/Passes.td` as `def MappingPass`,
+command-line name `place-and-route`, and implemented as the single `MappingPass`
+struct in `mlir/lib/Dialect/QCO/Transforms/Mapping/Mapping.cpp`. A *site* is a
+hardware qubit position, numbered from zero. A *program qubit* is a qubit of the
+user's circuit; which site holds which program qubit changes as SWAPs execute,
+and that assignment is the *layout*. A *fault-tolerant SWAP*, also called
+protected, is the expensive realisation; a *bare SWAP* is the cheap one. The
+pass never decides which is used; it only weighs how likely the expensive form
+is.
+
+This repository is `/Users/yudong/Documents/projects/mqt.core`. The sibling
+project holding the simulator and its recorded verdicts is
+`/Users/yudong/Documents/projects/qec-rydberg-ions`, whose Python is run through
+`uv run`.
 
 The routing loop works as follows. `advance()`, at approximately line 1438,
-executes every gate whose qubits are already on directly connected sites, and
+executes every gate whose qubits already sit on directly connected sites, and
 stops when no more can be executed. `getWindow()`, at approximately line 1343,
-then collects the gates that are blocked, in layers. `search()`, at
-approximately line 1091, runs an A\* search for a sequence of SWAPs that makes
-the first layer executable. `insertSWAPs`, at approximately line 1394, writes
-those SWAPs into the circuit. The loop then returns to `advance()`. Crucially,
-no gates execute between the start and the end of one `search()` call.
+collects the gates that are blocked, in layers. `search()`, at approximately
+line 1091, runs an A\* search for a sequence of SWAPs that makes the first layer
+executable. `insertSWAPs`, at approximately line 1394, writes those SWAPs into
+the circuit and records `stats.nswaps += swaps.size();` at approximately line
+1431. The loop then returns to `advance()`. Crucially, no gates execute between
+the start and the end of one `search()` call, so every SWAP a single search
+emits sees the same set of already-executed gates.
 
 The search expands a node by trying every coupling edge incident to a qubit in
 the front layer, at approximately lines 1155 to 1170. It early-exits before
@@ -166,202 +232,396 @@ lines 1104 to 1109; this is the fact that makes the SWAP-then-gate ordering
 impossible.
 
 Each search node accumulates a `pathCost` in its constructor at approximately
-lines 215 to 230. Today that accumulation is, as indented source:
+lines 211 to 232. The accumulation today is, as indented source:
 
-    float base = 1.0F;
-    if (useTypedCost) { ... base = typedSwapCost(qubitLabels[prog0], qubitLabels[prog1]); }
-    const float edgeMultiplier =
-        (useEdgeCost && nnnEdges.contains(swap)) ? nnnCostMultiplier : 1.0F;
-    pathCost += base * edgeMultiplier;
+    if (useTypedCost || useEdgeCost) {
+      float base = 1.0F;
+      if (useTypedCost) {
+        const auto [prog0, prog1] =
+            layout.getProgramIndices(swap.first, swap.second);
+        base = typedSwapCost(qubitLabels[prog0], qubitLabels[prog1]);
+      }
+      const float edgeMultiplier =
+          (useEdgeCost && nnnEdges.contains(swap)) ? nnnCostMultiplier : 1.0F;
+      pathCost += base * edgeMultiplier;
+    }
 
-`Node::g`, at approximately line 259, returns `alpha * pathCost` when a cost
-heuristic is active and `alpha * depth` otherwise. A node's `depth` field
-records how many SWAPs lie between it and the root, so the first SWAP of a
-search is the one on a node of depth one.
+and the ranking function `g()`, at approximately line 259, is:
 
-The search prunes a node if it has already seen the same layout at an equal or
-lower depth, at approximately lines 1113 and 1126 to 1136, using a map keyed on
-the layout. This is why a cost term must be a function of the node itself and
-not of how the node was reached: a term that depended on the path would make two
-nodes with the same layout genuinely different, and the pruning would discard
-the cheaper one. A discount applied only at depth one satisfies this, because
-depth is part of the node.
+    return alpha * ((useTypedCost || useEdgeCost)
+                        ? pathCost
+                        : static_cast<float>(depth));
 
-The prerequisite plan `.agent/plans/gate-adjacent-swap-statistic.md` has already
-added to this file two per-site vectors of `Operation*`, one recording the most
-recent two-qubit gate on each site and one recording the most recent gate of any
-arity, both updated in `advance()`; a predicate that decides whether a site pair
-qualifies; a counter in `struct Statistics`; and the statistic
-`numGateAdjacentSwaps`, command-line name `num-gate-adjacent-swaps`. This plan
-reuses all of it and adds none of it. If any of those pieces is missing, stop
-and implement that plan first.
+Note both guards carefully; they are the reason Milestone 3 must introduce a
+third activation flag rather than simply multiplying inside the existing
+expression.
 
-Two existing pass options establish the pattern this plan follows, both opt-in
-and both defaulting to off. `qubitTypeLabels` takes a string with one character
-per program qubit, `A` for auxiliary and `B` for data, and makes SWAP cost
-depend on the pair of roles. `nnnEdges` takes a comma-separated list of site
-pairs such as `2-4,5-7,8-10` and multiplies the cost of SWAPs crossing them by
-`nnnCostMultiplier`. Their parsers, `parseQubitLabels` and `parseNnnEdges`, are
-at approximately lines 489 and 522 and are called from `runOnOperation` at
-approximately lines 411 to 432.
+A node's `depth` field records how many SWAPs lie between it and the root, so
+the first SWAP of a search is the one on a node of depth one. The search prunes
+a node if it has already seen the same layout at an equal or lower depth, at
+approximately lines 1113 and 1126 to 1136, using a map keyed on the layout. This
+is why a cost term must be a function of the node itself and not of how the node
+was reached: a term depending on the path would make two nodes with the same
+layout genuinely different, and the pruning would discard the cheaper one. A
+discount applied only at depth one satisfies this, because depth is part of the
+node.
 
-One caveat for validation: the pass does not produce identical output across
-repeated runs of the same binary with the same inputs and seed, because
-`mlir/include/mlir/Dialect/QCO/Utils/Drivers.h` line 37 declares a hash map
-keyed on raw pointer values whose iteration order varies between process
-launches. Do not assert an exact SWAP sequence, and do not conclude from a
-single pair of runs that the option helped or did not.
+`struct Statistics`, at approximately line 160, currently holds one field,
+`size_t nswaps{0};`. The pass declares a statistic `numSwaps` with command-line
+name `num-inserted-swaps` in the tablegen file and accumulates it in
+`runOnOperation` at approximately line 476.
 
-For scale, on the Rydberg-ion hardware the expected error of a bare SWAP on a
-nearest-neighbour edge is one unit, and of a fault-tolerant SWAP on the same
-edge roughly seven and a half units. A discount of about one seventh therefore
-represents "this SWAP is certainly bare" under that cost model.
+Two existing pass options establish the pattern to follow, both opt-in and both
+defaulting to off. `qubitTypeLabels` takes a string with one character per
+program qubit, `A` for auxiliary and `B` for data, and makes a SWAP cost one,
+two or three according to the pair of roles. `nnnEdges` takes a comma-separated
+list of site pairs such as `2-4,5-7,8-10` and multiplies the cost of SWAPs
+crossing them by `nnnCostMultiplier`. Their parsers, `parseQubitLabels` and
+`parseNnnEdges`, are at approximately lines 489 and 522 and are called from
+`runOnOperation` at approximately lines 411 to 432.
+
+The existing test that exercises this configuration is
+`mlir/unittests/Dialect/QCO/Transforms/RydbergIons/test_rydberg_ions.cpp`, whose
+target has twelve sites and which invokes the pass with `nlookahead` five,
+`niterations` one, `ntrials` one, `seed` forty-two, `qubitTypeLabels` set to
+nine `B` characters followed by three `A` characters, and `nnnEdges` set to
+`2-4,5-7,8-10`. Both cost heuristics are therefore active there, which is why
+the activation problem above does not show up in that test.
+
+The pass does not produce identical output across repeated runs of the same
+binary with the same inputs and the same seed. The cause is
+`mlir/include/mlir/Dialect/QCO/Utils/Drivers.h` line 37, which declares
+`using ReadyMap = llvm::SmallDenseMap<Operation*, SmallVector<size_t>, 8>;`, a
+map keyed on heap addresses, iterated during routing at `Mapping.cpp` line 1354.
+Five consecutive runs of the Rydberg-ion test with identical inputs produced 83,
+85, 86, 86 and 93 inserted SWAPs. Every measurement in this plan is therefore a
+measurement of a distribution, and no single pair of runs proves anything.
+
+For Gate 0, the data already on disk in the sibling repository is as follows.
+Two routed circuits are checked in as `scripts/test_cases/4.in` and
+`scripts/test_cases/5.in`. A routing report is a text file whose parser is
+`parse_mapper_output` in `src/mapper_output.py`; it returns an object with a
+`gates` field, a list whose entries have a `kind` among `reset`, `h`, `x`, `cx`,
+`cz`, `ccx`, `ccz` and `swap`, and a `qubits` tuple of site indices, in circuit
+order. The simulator's verdicts are checked in as
+`scripts/output/4.in.greedy_checkpoint.json`,
+`scripts/output/4.in.greedy_checkpoint.btf.json` and
+`scripts/output/5.in.greedy_checkpoint.json`. Each is a single-line JSON object
+with keys `num_swaps`, `next_index` and `ft_status`, the last being a list of
+booleans, one per SWAP **in circuit order**, where true means the SWAP remained
+protected and false means it was downgraded to bare. That two checkpoints exist
+for `4.in` is useful: they come from walks in different directions over the same
+routing, so comparing them measures directly how order-dependent the verdicts
+are.
+
+The hardware facts this plan relies on, supplied by the hardware owner: the
+native two-qubit entangling gate is CZ; a bare SWAP is three CZ gates; a
+protected SWAP is nine, arranged as three bare SWAPs through an ancilla; a bare
+nearest-neighbour SWAP costs one unit of expected error and a protected one
+about seven and a half.
 
 ## Plan of Work
 
+### Milestone 0 — test the premise against existing verdicts
+
+Write a throwaway analysis script; it belongs in the sibling repository and is
+to be manually checked in by the user. Its output must be recorded in this plan.
+
+For each of the two checked-in routings, parse the report and walk its gate list
+in order, keeping a counter of how many SWAPs have been seen so far, which is
+the index into the verdict list. For each SWAP on sites a and b, scan backwards
+from it through the gate list for the first gate that touches either a or b. The
+SWAP qualifies if that gate is a two-qubit gate acting on exactly the pair a and
+b. Scanning backwards is the correct direction; scanning forwards from the SWAP
+finds nothing, for the reason recorded in `Surprises & Discoveries`.
+
+For every qualifying SWAP, read its verdict from the checkpoint's `ft_status` at
+the SWAP's index. Report how many qualified and how many of those were left
+bare. Run it for `4.in` against both of its checkpoints and for `5.in` against
+its one.
+
+Interpret as follows. If every qualifying SWAP was left bare, the premise holds
+and the work is worth continuing. If some were left protected, do not proceed
+until you understand why: either the premise is wrong, in which case stop and
+record that, or the greedy walk's ordering prevented a downgrade that was in
+fact available, in which case the two `4.in` checkpoints will probably disagree
+with each other and that disagreement is the evidence. A premise that fails here
+cannot be rescued by anything later in this plan.
+
+Then compute the ceiling on benefit and write it into
+`Outcomes & Retrospective`: take the measured qualifying count, assume the
+discount doubles it, multiply the increase by the fraction of SWAPs that are
+otherwise protected, and multiply that by the difference between the protected
+and bare costs. Compare the result with the total routing cost. This number sets
+expectations for Gate 4 and should be computed before anybody has an emotional
+stake in the outcome.
+
+### Milestone 1 — instrumentation, with no change in behaviour
+
+In `mlir/lib/Dialect/QCO/Transforms/Mapping/Mapping.cpp`, add two vectors to the
+state the routing loop carries, each indexed by site and holding an
+`Operation*`, sized to the target's site count and initialised to null. The
+first records the most recent two-qubit gate to have acted on that site; the
+second records the most recent gate of any arity. Place them with the routing
+loop's other per-run state and make sure they are reset for each routing pass,
+including the refinement passes `generateLayout` runs, so a stale entry cannot
+leak between passes.
+
+Update both in `advance()` where a gate is recorded as executed. For every site
+the gate touches, set the any-arity entry to that gate; if the gate acts on
+exactly two qubits, also set the two-qubit entry for both its sites. Do this for
+gates of every arity including the native three-qubit gates, because a
+three-qubit gate touching a site must invalidate that site's pair even though it
+never establishes one.
+
+Add a predicate taking a pair of sites. The pair qualifies when the most recent
+two-qubit gate on the first site is not null, is the same operation as the most
+recent two-qubit gate on the second site, and is also the most recent gate of
+any arity on each of the two sites. That last condition enforces "nothing in
+between", including single-qubit gates, because any later gate on either site
+would have overwritten that site's any-arity entry.
+
+Add `size_t nGateAdjacentSwaps{0};` to `struct Statistics`. In `insertSWAPs`,
+evaluate the predicate on each emitted SWAP's site pair and increment the
+counter. Within one call the tracking vectors do not change, because no gates
+execute during a search, so evaluating per SWAP is correct; add a comment saying
+so, because a later reader will suspect otherwise.
+
+In `mlir/include/mlir/Dialect/QCO/Transforms/Passes.td`, add a statistic beside
+`numSwaps` named `numGateAdjacentSwaps`, command-line name
+`num-gate-adjacent-swaps`, documented as the number of inserted SWAP operations
+that acted on exactly the site pair of the immediately preceding two-qubit gate
+with no intervening gate on either site. Accumulate it in `runOnOperation`
+beside `numSwaps`.
+
+Nothing in this milestone may change which SWAPs are chosen. If routed output
+changes, something is wrong.
+
+### Milestone 2 — a measurement instrument and the baseline
+
+Add a seed loop to
+`mlir/unittests/Dialect/QCO/Transforms/RydbergIons/test_rydberg_ions.cpp` as a
+new `TEST_F` beside the existing ones. It builds the program and runs the pass
+once per seed for at least thirty seeds within the one process, collecting the
+SWAP count and the qualifying count each time, and prints a summary giving the
+mean, the minimum and the maximum of each. Keep `ntrials` at one, for the reason
+in the `Decision Log`.
+
+Do not assert on the numbers. This test exists to print a distribution, and any
+threshold written into it now would be a guess. Guard it so that it does not
+slow the ordinary test run unreasonably; at roughly thirty-six milliseconds per
+routing, thirty seeds is about a second, which is acceptable, but check rather
+than assume.
+
+Run it and record the baseline distribution in `Outcomes & Retrospective`. That
+distribution, not the four-circuit scan quoted in `Surprises & Discoveries`, is
+the number Gate 4 compares against.
+
+### Milestone 3 — the discount
+
 In `mlir/include/mlir/Dialect/QCO/Transforms/Passes.td`, add one option to the
 `let options` list of `def MappingPass`, named `gateAdjacentSwapDiscount`,
-command line name `gate-adjacent-swap-discount`, of type `float`, default
-`1.0F`, documented as the factor by which the cost of a SWAP is multiplied when
-it acts on exactly the site pair that a two-qubit gate has just acted on with
-nothing in between touching either site; a value of one, the default, disables
-the feature. Extend the pass description in the same file with a prose paragraph
-in the style of the two existing heuristic paragraphs, explaining why such a
-SWAP is cheaper.
+command-line name `gate-adjacent-swap-discount`, of type `float`, default
+`1.0F`, documented as the factor by which a SWAP's cost is multiplied when it
+acts on exactly the site pair a two-qubit gate has just acted on with nothing in
+between touching either site; a value of one, the default, disables the feature.
+Extend the pass description with a prose paragraph in the style of the two
+existing heuristic paragraphs.
 
-In `mlir/lib/Dialect/QCO/Transforms/Mapping/Mapping.cpp`, compute once per
-`search()` call, before the search begins, the set of site pairs that satisfy
-the predicate the prerequisite plan added. There is at most one qualifying
-partner per site, but several distinct pairs may qualify simultaneously, so
-build a small set rather than a single pair. Pass that set to the node
-constructor alongside the existing `nnnEdgeSet` and `qubitLabels`.
+In `Mapping.cpp`, compute once per `search()` call, before the search begins,
+the set of site pairs satisfying the Milestone 1 predicate. There is at most one
+qualifying partner per site but several distinct pairs may qualify at once, so
+build a small set rather than a single pair, and pass it to the node constructor
+alongside the existing `nnnEdgeSet` and `qubitLabels`.
+
+Introduce a third activation flag, for example `useGateAdjacentCost`, set when
+`gateAdjacentSwapDiscount` differs from one, and include it in **both** guards
+quoted in the orientation section: the `if (useTypedCost || useEdgeCost)` around
+the cost accumulation, and the conditional inside `g()`. Without this the
+discount has no effect whenever neither existing heuristic is enabled. State the
+consequence in the option's documentation: with only the discount enabled, every
+SWAP costs one except qualifying ones which cost the discount, so the search
+minimises a weighted count rather than a plain depth — the intended meaning, but
+a different objective from the default that a reader will not guess.
 
 In the node constructor, after computing `base` and `edgeMultiplier` as today,
-multiply the result by `gateAdjacentSwapDiscount` when the node's depth is one
-and the node's SWAP is in that set. Guard the whole thing so that when the
-option is left at one, the arithmetic is unchanged.
-
-Handle the activation problem recorded in `Surprises & Discoveries`. The cost
-accumulation and the ranking function `g()` are both guarded by
-`useTypedCost || useEdgeCost`, so a discount applied inside that guard has no
-effect whatever when neither existing heuristic is enabled. Introduce a third
-flag, for example `useGateAdjacentCost`, set when `gateAdjacentSwapDiscount`
-differs from one, and include it in both guards so that the three heuristics
-activate weighted costs on equal terms. Note the consequence and state it in the
-option's documentation: with only the discount enabled, every SWAP costs one
-except the qualifying ones, which cost the discount, so the search minimises a
-weighted count rather than a plain depth. That is the intended meaning, but it
-is a different objective from the default and a reader will not guess it.
-
-Assert, in a form that survives into debug builds, that the discount is never
-applied at a depth other than one. That assertion is the guard against the
-duplicate-state pruning hazard described in the orientation section, and it is
+multiply by `gateAdjacentSwapDiscount` when the node's depth is one and the
+node's SWAP is in the qualifying set. Guard it so that with the option at one
+the arithmetic is unchanged. Assert, in a form surviving into debug builds, that
+the discount is never applied at a depth other than one; that assertion is the
+guard against the duplicate-state pruning hazard described above, and it is
 cheap.
 
-The statistic itself needs no change: the prerequisite plan already counts
-qualifying SWAPs unconditionally, so the same statistic measures the baseline
-and the improvement.
+The statistic needs no change: Milestone 1 counts qualifying SWAPs
+unconditionally, so the same instrument measures baseline and improvement.
+
+### Milestone 4 — measure and decide
+
+Run the Milestone 2 loop with the discount disabled and then at several values,
+such as one half, one quarter and one seventh, the last being what "this SWAP is
+certainly bare" means under the fidelity-weighted cost model. Compare
+distributions across at least thirty seeds, never individual runs.
+
+Then decide, and record the decision whichever way it goes. If the qualifying
+count rises materially and the total cost does not, keep the option and note
+what discount value to recommend. If the count barely moves, say so, recommend
+removing the option, and leave this plan in place carrying the finding.
 
 ## Concrete Steps
 
-Work from the repository root at `/Users/yudong/Documents/projects/mqt.core`.
+For Gate 0, work from `/Users/yudong/Documents/projects/qec-rydberg-ions` and
+run the analysis through `uv run python`. The inputs are
+`scripts/test_cases/4.in` and `5.in` and the three checkpoint files named in the
+orientation section. Expect the script to print, per routing, the number of
+SWAPs, the number that qualify, and how many of those were left bare.
 
-Establish a baseline:
+For everything else, work from `/Users/yudong/Documents/projects/mqt.core`.
+
+Establish a baseline before editing:
 
     cmake --preset release
     cmake --build --preset release --target mqt-core-mlir-unittest-mapping
     ./build/release/mlir/unittests/Dialect/QCO/Transforms/Mapping/mqt-core-mlir-unittest-mapping
 
-Record the number of passing tests. After the edits, rebuild and rerun; the
-count must be identical, because every existing test leaves the new option at
-its default of one.
+Expect a transcript ending in a line reporting all tests passed; record the
+count. After Milestone 1 and again after Milestone 3, rebuild and rerun; the
+count must be the baseline plus whatever tests this plan adds, because Milestone
+1 changes no behaviour and Milestone 3 leaves its option at one in every
+pre-existing test.
 
-For the measurement, use the routing tool from
-`.agent/plans/rydberg-ion-routing-tool.md`, which is required rather than merely
-preferred here: the effect must be measured over at least thirty seeds, and
-changing the seed in the unit test requires a rebuild. With that tool built,
-collect `num-gate-adjacent-swaps` and the total cost across a range of seeds
-with the discount disabled, then repeat with several discount values such as one
-half, one quarter and one seventh. Compare distributions, not individual runs.
+Build and run the Rydberg-ion binary, which is where the seed loop lives:
 
-The harness described in
-`/Users/yudong/Documents/projects/qec-rydberg-ions/.agent/plans/compiler-evaluation-harness.md`
-automates exactly this sweep and is the better instrument if it exists.
+    cmake --build --preset release --target mqt-core-mlir-unittest-rydberg-ions
+    ./build/release/mlir/unittests/Dialect/QCO/Transforms/RydbergIons/mqt-core-mlir-unittest-rydberg-ions
+
+Expect its existing tests to pass unchanged and the new loop to print its
+summary.
+
+If `.agent/plans/rydberg-ion-routing-tool.md` has been completed by the time
+Gate 4 is reached, prefer that tool for the sweep, since it varies the discount
+without a rebuild. It is not a prerequisite.
 
 ## Validation and Acceptance
 
-Add two GoogleTests to
+Gate 0 has no automated test; its acceptance is the recorded finding, and its
+failure mode is a premise that does not hold, which stops the plan.
+
+For Milestone 1, add two GoogleTests to
 `mlir/unittests/Dialect/QCO/Transforms/Mapping/test_mapping.cpp`.
 
-The first asserts inertness at the default. Route a small circuit twice with
+The first proves the counter is right on a case whose answer is known by hand.
+Construct a target and a circuit small enough to trace manually, containing a
+two-qubit gate on a pair of qubits followed by a situation forcing the router to
+swap that same pair, and assert the statistic reports one. Then insert a
+single-qubit gate on one of the two qubits between the gate and the swap and
+assert the statistic reports zero. That second case is what proves the any-arity
+condition is enforced rather than accidentally satisfied.
+
+The second proves Milestone 1 changed nothing observable: route the same circuit
+twice within one process with identical options and assert the SWAP count is
+identical and the statistic is no greater than it. The stronger guarantee, that
+output matches the previous commit byte for byte, cannot be asserted in a test
+because output varies between process launches; check it by hand by running the
+Rydberg-ion binary several times before and after and confirming the SWAP counts
+fall in the same range.
+
+For Milestone 3, add two more tests.
+
+The first asserts inertness at the default: route a small circuit twice with
 identical options except that the second sets `gateAdjacentSwapDiscount` to one
-explicitly, and assert the routed modules are structurally identical. This
-proves the default path is untouched.
+explicitly, and assert the routed modules are structurally identical.
 
-The second asserts the bias changes a decision. Construct a target and a circuit
-in which, at some point during routing, two candidate first SWAPs are equally
-good under the existing cost model, and exactly one of them acts on the site
-pair of the gate that has just executed. With the discount at one the choice
-between them is arbitrary; with the discount well below one the qualifying SWAP
-must win. Assert on the operands of the first emitted SWAP operation, following
-the assertion style the existing `qubitTypeLabels` test uses. Construct the
-circuit so that the two candidates are genuinely tied under the old model,
-otherwise the test proves nothing about the new term.
+The second asserts the discount changes a decision. Construct a target and
+circuit in which two candidate first SWAPs are equally good under the existing
+cost model and exactly one of them acts on the site pair of the gate that has
+just executed. With the discount at one the choice is arbitrary; with the
+discount well below one the qualifying SWAP must win. Assert on the operands of
+the first emitted SWAP, following the assertion style the existing
+`qubitTypeLabels` test uses. Enable one of the existing cost heuristics in this
+test, or rely on the new activation flag being correctly wired — and if the test
+fails, check that first, because this is exactly the failure the third entry in
+`Surprises & Discoveries` predicts. Construct the circuit so the two candidates
+are genuinely tied under the old model, otherwise the test proves nothing about
+the new term.
 
-The behavioural acceptance for the overall purpose is the measurement described
-under Concrete Steps: over at least thirty seeds, enabling the discount must
-increase the mean of the `num-gate-adjacent-swaps` statistic and must not
-increase the mean total SWAP cost. If the measurement shows the qualifying count
-barely moves, that is a legitimate outcome and must be recorded in
-`Outcomes & Retrospective` together with a recommendation about whether to keep
-the option. Do not tune the test circuit until the measurement looks good; the
-measurement is the experiment, not the acceptance gate.
+The behavioural acceptance for the plan as a whole is the Gate 4 measurement:
+over at least thirty seeds, enabling the discount must increase the mean
+qualifying count and must not increase the mean total SWAP cost. If the count
+barely moves, that is a legitimate outcome, must be recorded, and must carry a
+recommendation about whether to keep the option. Do not tune the test circuit
+until the measurement looks good; the measurement is the experiment, not the
+acceptance gate.
 
 ## Idempotence and Recovery
 
-All steps are repeatable and nothing outside the build directory is modified.
+All build and run steps are repeatable and nothing outside the build directory
+is modified. The Gate 0 script only reads.
 
-The risk concentrated in this change is the interaction with the search's
+The risk concentrated in Milestone 3 is the interaction with the search's
 duplicate-state pruning. If the discount is ever applied at a depth other than
 one, two nodes with the same layout can carry different costs and the pruning
 will discard the cheaper one, producing worse routings in a way that is hard to
 notice because the output is still correct. The debug assertion required above
 is the guard; keep it.
 
-If the mapping tests regress, confirm first that the option is at its default in
-those tests and that the guarded arithmetic reduces exactly to the original
+The likeliest correctness bug in Milestone 1 is forgetting to reset the tracking
+vectors between routing passes, because `generateLayout` runs several refinement
+passes over the same program before the real one. The symptom is a count that is
+too high and that changes when `niterations` or `ntrials` changes even though
+the final routing did not. Reset them where the routing state is otherwise
+initialised, and include a test that runs with `ntrials` greater than one.
+
+If the mapping tests regress after Milestone 1, look first at whether updating
+the tracking vectors changed control flow in `advance()`; keep those updates to
+pure assignment with no early returns and no conditions beyond the arity check.
+If they regress after Milestone 3, confirm the option is at its default in those
+tests and that the guarded arithmetic reduces exactly to the original
 expression.
 
 ## Artifacts and Notes
 
-The reasoning behind the rule, recorded so a later reader does not have to
-reconstruct it. A SWAP is three CZ gates on this hardware, and a fault-tolerant
-SWAP is nine, arranged as three bare SWAPs through an ancilla. Protection is
-needed when a single fault on one of the two qubits could propagate onto the
-other and produce a correlated error of weight two that the code cannot correct.
-If a two-qubit gate of the original circuit has just coupled exactly those two
-qubits, that propagation path already existed, and the original circuit was
-designed to tolerate it. Hence the SWAP adds no new uncorrectable path and may
-stay bare.
+The reasoning behind the rule, recorded so a later reader need not reconstruct
+it. A SWAP is three CZ gates on this hardware, and a protected SWAP is nine,
+arranged as three bare SWAPs through an ancilla. Protection is needed when a
+single fault on one of the two qubits could spread onto the other and produce a
+correlated error of weight two that the code cannot correct. If a two-qubit gate
+of the original circuit has just coupled exactly those two qubits, that path
+already existed and the original circuit was designed to tolerate it, so the
+SWAP adds no new uncorrectable path.
 
-A reference implementation of the related circuit rewrite, which is not what
-this plan does but is worth reading for the algebra, is
-`CircuitOptimizer::cancelCNOTs` in `src/circuit_optimizer/CircuitOptimizer.cpp`
-at approximately lines 1182 to 1202, which rewrites a controlled-NOT followed by
-a SWAP on the same pair into two controlled-NOTs. It belongs to the repository's
-legacy non-MLIR code path and is not wired into this pipeline.
+A related circuit rewrite, which is not what this plan does but is worth reading
+for the algebra, is `CircuitOptimizer::cancelCNOTs` in
+`src/circuit_optimizer/CircuitOptimizer.cpp` at approximately lines 1182 to
+1202, which rewrites a controlled-NOT followed by a SWAP on the same pair into
+two controlled-NOTs. It belongs to the repository's legacy non-MLIR code path
+and is not wired into this pipeline.
+
+A caveat that applies to Gate 0 and to every number derived from the simulator:
+the verdicts come from a greedy, order-dependent, single-pass search, so they
+are an upper bound on how many SWAPs genuinely require protection rather than an
+exact count. The two differently-ordered checkpoints for `4.in` are the means of
+estimating how large that effect is.
 
 ## Interfaces and Dependencies
 
-No new libraries. The change is confined to `MLIRQCOTransforms` and its tablegen
-declaration. It depends on `.agent/plans/gate-adjacent-swap-statistic.md` having
-landed first.
+No new libraries. The compiler changes are confined to `MLIRQCOTransforms` and
+its tablegen declaration. Gate 0 uses only the sibling repository's existing
+`src/mapper_output.py` and checked-in data.
 
-At the end of this milestone the following must exist. `def MappingPass` in
-`mlir/include/mlir/Dialect/QCO/Transforms/Passes.td` must declare an option
-`gateAdjacentSwapDiscount` with command-line name `gate-adjacent-swap-discount`
-defaulting to one, alongside the statistic `numGateAdjacentSwaps` that the
-prerequisite plan added. The generated `MappingPassOptions` struct gains one
-correspondingly named field, and the existing caller in
-`mlir/lib/Compiler/TargetCompilation.cpp`, which constructs a default
-`MappingPassOptions{}`, must continue to compile unchanged.
+This plan has no prerequisite ExecPlans. It interacts with two:
+`.agent/plans/cost-weighted-trial-selection.md`, which is why measurement keeps
+`ntrials` at one until that has landed; and
+`.agent/plans/rydberg-ion-routing-tool.md`, which would be a better instrument
+for Gate 4 but is not required.
+
+At the end of this milestone sequence the following must exist.
+`struct Statistics` in `Mapping.cpp` carries a qualifying-SWAP counter beside
+`nswaps`. `def MappingPass` in `Passes.td` declares a statistic
+`numGateAdjacentSwaps` with command-line name `num-gate-adjacent-swaps` and an
+option `gateAdjacentSwapDiscount` with command-line name
+`gate-adjacent-swap-discount` defaulting to one. The generated
+`MappingPassOptions` struct gains one correspondingly named field, and the
+existing caller in `mlir/lib/Compiler/TargetCompilation.cpp`, which constructs a
+default `MappingPassOptions{}`, must continue to compile unchanged. A seed-loop
+test exists in the Rydberg-ion test file. `Outcomes & Retrospective` records the
+Gate 0 finding, the Gate 2 baseline and the Gate 4 result.

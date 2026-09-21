@@ -1,5 +1,11 @@
 # Count the SWAPs that immediately follow a two-qubit gate on the same qubit pair
 
+> **Superseded.** This plan has been merged into
+> `.agent/plans/gate-adjacent-swap-bias.md`, which now covers the premise check,
+> this instrumentation, the measurement loop and the cost discount as four gated
+> milestones. Everything below is incorporated there as Milestone 1. Do not
+> implement this file.
+
 This ExecPlan is a living document. The sections `Progress`,
 `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must
 be kept up to date as work proceeds.
