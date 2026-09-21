@@ -67,6 +67,23 @@ cost must not rise with it.
   gate-then-SWAP ordering therefore needs to be handled, and only for the first
   SWAP of each search, because no gates execute during a search.
 
+- Observation: the discount is silently inert unless one of the two existing
+  cost heuristics is already switched on, and the implementation must handle
+  this explicitly rather than assume otherwise. Evidence: in the `Node`
+  constructor at `Mapping.cpp` approximately line 219, the whole cost
+  accumulation is wrapped in `if (useTypedCost || useEdgeCost) { ... }`, so with
+  neither heuristic active `pathCost` is never incremented; and `g()` at
+  approximately line 259 returns
+  `alpha * ((useTypedCost || useEdgeCost) ? pathCost : static_cast<float>(depth))`,
+  so with neither active the search ranks purely by how many SWAPs deep a node
+  is and ignores `pathCost` entirely. A discount written inside that guard
+  therefore does nothing at all in the default configuration. Either the
+  discount must join the predicate that decides whether weighted costs are in
+  use, or the pass must reject a discount other than one when neither existing
+  heuristic is set. This matters for the tests in particular: a test that
+  enables only the discount and expects a changed routing will fail for this
+  reason and the cause is not obvious.
+
 - Observation: the opportunity is rare in the circuits measured so far, so the
   value of this change is unproven. Evidence: the same scan found between two
   and five qualifying SWAPs out of seventy-six to eighty-eight total. Whether
@@ -223,6 +240,18 @@ In the node constructor, after computing `base` and `edgeMultiplier` as today,
 multiply the result by `gateAdjacentSwapDiscount` when the node's depth is one
 and the node's SWAP is in that set. Guard the whole thing so that when the
 option is left at one, the arithmetic is unchanged.
+
+Handle the activation problem recorded in `Surprises & Discoveries`. The cost
+accumulation and the ranking function `g()` are both guarded by
+`useTypedCost || useEdgeCost`, so a discount applied inside that guard has no
+effect whatever when neither existing heuristic is enabled. Introduce a third
+flag, for example `useGateAdjacentCost`, set when `gateAdjacentSwapDiscount`
+differs from one, and include it in both guards so that the three heuristics
+activate weighted costs on equal terms. Note the consequence and state it in the
+option's documentation: with only the discount enabled, every SWAP costs one
+except the qualifying ones, which cost the discount, so the search minimises a
+weighted count rather than a plain depth. That is the intended meaning, but it
+is a different objective from the default and a reader will not guess it.
 
 Assert, in a form that survives into debug builds, that the discount is never
 applied at a depth other than one. That assertion is the guard against the
