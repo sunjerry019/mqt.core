@@ -47,9 +47,13 @@ rise with it.
 
 ## Progress
 
-- [ ] **Gate 0.** Test the premise against existing data: confirm that the SWAPs
-      which already qualify were in fact left unprotected by the simulator.
-      Record the finding and the estimated ceiling on benefit.
+- [x] (2026-09-22) **Gate 0.** Tested the premise against existing data: all
+      seven qualifying SWAPs across the two checked-in routings were left
+      unprotected by the simulator. The premise holds; the finding and the
+      estimated ceiling on benefit are recorded in `Outcomes & Retrospective`.
+      The script is `scripts/gate_adjacent_swap_premise.py` in the sibling
+      repository. The two opposite walk orders over `4.in` were also compared
+      and agree on every SWAP.
 - [ ] **Gate 1.** Add the per-site gate tracking, the qualifying predicate and
       the statistic. No routing decision changes.
 - [ ] Confirm routed output is unaffected by Milestone 1.
@@ -80,6 +84,28 @@ rise with it.
   every two-qubit gate looking for a following SWAP, or equivalently backward
   from every SWAP. Recording this because the same mistake is easy to repeat
   when writing the Gate 0 script.
+
+- Observation: the two walk orders over `4.in` produce *identical* verdicts on
+  all seventy-six SWAPs, so on this routing the greedy walk's order-dependence
+  is zero and its verdicts are not merely an upper bound. The two walks are
+  recorded in `scripts/test_cases/4.btf.out` (back-to-front) and
+  `scripts/test_cases/4.ftb.out` (front-to-back), not in the checkpoint files,
+  which the orientation section wrongly identified as the two directions; the
+  two checkpoint JSONs are byte-identical to each other and agree with both
+  walks. The walk direction is confirmed from the logs themselves rather than
+  their names: the back-to-front log prints an explicit descending swap index,
+  and the front-to-back log, which prints no index, matches its own resulting
+  circuit only when its progress lines are read in forward order. Their per-swap
+  progress lines differ, which is purely the visiting order; their final
+  circuits are identical line for line apart from the output path.
+
+- Observation: the verdicts are more reliably read from the resulting
+  `CompiledCircuit` repr at the end of a `--mode greedy` log than from either
+  the progress lines or the checkpoint. The repr spells out every SWAP in
+  circuit order as a plain `swap` or a three-site `swap_ft`, which is
+  unambiguous even for the front-to-back log whose progress lines carry no swap
+  index, and it can be cross-checked against the routing's own SWAP site pairs.
+  The Gate 0 script does that cross-check before trusting any verdict source.
 
 - Observation: the discount is silently inert unless one of the two existing
   cost heuristics is already switched on, and the implementation must handle
@@ -176,12 +202,63 @@ rise with it.
 
 ## Outcomes & Retrospective
 
-Not yet started.
+**Gate 0, 2026-09-22: the premise holds; proceed.** Measured by
+`scripts/gate_adjacent_swap_premise.py` in the sibling repository, run as
+`uv run python scripts/gate_adjacent_swap_premise.py`, which reads the routings
+and checkpoints only.
 
-On completion of Gate 0, record how many qualifying SWAPs were found in each
-checked-in routing, how many of those the simulator left unprotected, whether
-the two available walk orders for the same routing agreed, and the estimated
-ceiling on benefit.
+`scripts/test_cases/4.in` contains 76 SWAPs, of which the simulator left 27
+protected and downgraded 49 to bare, a protected fraction of 0.355. Five SWAPs
+qualify: swap indices 2, 10, 16, 40 and 67, on site pairs (2,4), (4,5), (8,10),
+(1,2) and (8,9), each immediately preceded by a `cx` on exactly that pair. All
+five were left bare.
+
+The two walk orders agree completely. Checked against the back-to-front walk in
+`scripts/test_cases/4.btf.out`, the front-to-back walk in
+`scripts/test_cases/4.ftb.out` and both checkpoint files, all four verdict
+sources give the same decision for every one of the 76 SWAPs; no swap index
+differs anywhere. The order-dependence of the greedy walk is therefore zero on
+this routing, which is a stronger result than the plan anticipated: on `4.in`
+the verdicts are not merely an upper bound on how many SWAPs need protection but
+appear to be the answer. One routing is not proof that this holds generally, and
+`5.in` has only one walk, so the caveat stays live for other inputs.
+
+`scripts/test_cases/5.in` contains 84 SWAPs, of which 31 were left protected and
+53 downgraded, a protected fraction of 0.369. Two SWAPs qualify: indices 40 and
+66, on pairs (1,2) and (4,5). Both were left bare.
+
+No qualifying SWAP was left protected anywhere, so nothing needs the
+greedy-ordering explanation the plan held in reserve. The measured counts of
+five and two match the four-circuit scan quoted in `Surprises & Discoveries`,
+which is a consistency check on the scan rather than new information.
+
+Ceiling on benefit, computed as the plan prescribes: assume the discount doubles
+the qualifying count, multiply the increase by the measured protected fraction,
+and multiply by the protected-minus-bare cost difference of 6.5 units. For
+`4.in` that is 5 x 0.355 x 6.5 = 11.5 units against a total SWAP cost of 251.5,
+or 4.6 percent. For `5.in` it is 2 x 0.369 x 6.5 = 4.8 units against 285.5, or
+1.7 percent. Total SWAP cost here is the measured verdicts priced at one unit
+per bare SWAP and seven and a half per protected one. These figures are the
+ceiling on a doubling, not an expectation: the real effect is whatever fraction
+of that doubling the discount actually achieves, and Gate 4 measures it. Low
+single-digit percent is the shape of the answer to expect, as the fourth entry
+in `Surprises & Discoveries` already predicted.
+
+The script reports each routing under two readings of "nothing in between",
+differing in whether a preceding routing SWAP on exactly the same site pair
+blocks qualification or is transparent. The Milestone 1 predicate as specified
+implements the transparent reading, because it tracks only gates executed in
+`advance()` and inserted SWAPs never update it. On this data the two readings
+agree exactly, in every routing, so the choice is unobservable here and
+Milestone 1 need not revisit it. It may separate the two once the discount
+starts producing same-pair SWAP chains, which is worth rechecking at Gate 4.
+
+One caveat carried forward, weakened by the agreement above: the verdicts come
+from a greedy, single-pass search, so in general they are an upper bound on how
+many SWAPs genuinely require protection rather than an exact count. On `4.in`
+the two opposite walk orders agree exactly, so on that routing the bound is
+tight; whether that survives to other routings is untested, `5.in` having been
+walked only once.
 
 On completion of Gate 2, record the distribution of the qualifying-SWAP count
 and of the total SWAP count across the measured seeds: mean, spread and range,
@@ -309,10 +386,14 @@ order. The simulator's verdicts are checked in as
 `scripts/output/5.in.greedy_checkpoint.json`. Each is a single-line JSON object
 with keys `num_swaps`, `next_index` and `ft_status`, the last being a list of
 booleans, one per SWAP **in circuit order**, where true means the SWAP remained
-protected and false means it was downgraded to bare. That two checkpoints exist
-for `4.in` is useful: they come from walks in different directions over the same
-routing, so comparing them measures directly how order-dependent the verdicts
-are.
+protected and false means it was downgraded to bare. The two checkpoints for
+`4.in` are byte-identical and are *not* the two walk directions. The two
+directions are the full run logs `scripts/test_cases/4.btf.out`, back-to-front,
+and `scripts/test_cases/4.ftb.out`, front-to-back; each ends with a
+`CompiledCircuit` repr naming every SWAP as a plain `swap` or a `swap_ft` in
+circuit order, which is where their verdicts should be read from. Comparing
+those two measures directly how order-dependent the verdicts are; Gate 0 did so
+and found no difference at all.
 
 The hardware facts this plan relies on, supplied by the hardware owner: the
 native two-qubit entangling gate is CZ; a bare SWAP is three CZ gates; a
