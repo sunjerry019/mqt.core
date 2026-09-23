@@ -352,10 +352,16 @@ figure of 2.44 units per SWAP moved into the qualifying set derived in
 `Surprises & Discoveries`: raising `4.in` from 5 qualifying SWAPs to 31 percent
 of 76, or about 24, is 19 SWAPs at 2.44 units, or 46 units against a total SWAP
 cost of 251.5 --- 18 percent. The same calculation on `5.in` gives 24 SWAPs at
-2.44 units, or 59 units against 285.5 --- 21 percent. The expected shape of the
-answer therefore moves from low single-digit percent to something closer to a
-fifth of the routing cost, and the recommendation to proceed past Gate 0 is now
-much better supported than it was.
+2.44 units, or 59 units against 285.5 --- 21 percent. Those two totals are the
+flat metric, so the calculation should be redone with each SWAP priced by the
+connection it crosses. Doing so: a SWAP moved into the qualifying set saves 2.46
+units on a nearest-neighbour connection and 6.42 on a diagonal, and weighting by
+each circuit's own mix gives 72 units against 503.0 for `4.in`, or 14 percent,
+and 62 against 307.0 for `5.in`, or 20 percent. The conclusion is insensitive to
+the metric even though the totals are not. Either way the expected shape of the
+answer moves from low single-digit percent to between a seventh and a fifth of
+the routing cost, and the recommendation to proceed past Gate 0 is much better
+supported than it was.
 
 Three cautions attach to that number and none of them should be dropped when it
 is quoted. First, the hand-written circuits are not an achievability target for
@@ -372,20 +378,25 @@ ceiling remains a ceiling. Gate 4 measures what fraction of it the discount
 actually reaches, and a result far below it is still a legitimate outcome to
 record.
 
-One further asymmetry, which matters for any cost comparison against these
-circuits rather than for this plan's own arithmetic. Priced the same way, at one
-unit per bare SWAP and seven and a half per protected one, `MANUAL_OPTIMAL`
-scores 239.5 and `MANUAL_KATRIN` scores 298, against 251.5 for `4.in` and 285.5
-for `5.in`. Read naively that says the router is already within five percent of
-the expert compilation and beats the other one outright. Do not read it that way
-without checking, because the two sides do not have the same provenance: the
-routed circuits' protected-or-bare verdicts come from the simulator's greedy
-downgrade search, whereas the hand-written circuits' `swap` and `swap_ft`
-choices are their author's, made by hand. The apples-to-apples comparison is to
-run the same greedy downgrade over the manual circuits and price the result, and
-it is worth doing --- it either lowers the manual circuits' cost, which sharpens
-the target, or it reports that some of their bare SWAPs need protection, which
-would be a finding about the reference itself. That check belongs to the sibling
+Two cautions about comparing costs against these circuits, as opposed to this
+plan's own arithmetic. The first is the metric. Priced flat, at one unit per
+bare SWAP and seven and a half per protected one, `MANUAL_OPTIMAL` scores 239.5
+and `MANUAL_KATRIN` 298, against 251.5 for `4.in` and 285.5 for `5.in`, which
+reads as the router being within five percent of the expert compilation. That
+reading is an artefact of the flat metric. Pricing each SWAP by the connection
+it crosses gives 240.9, 300.0, 503.0 and 307.0, because the two hand-compiled
+circuits never swap across a diagonal at all while `4.in` does so 27 times in
+76. On that circuit the router is about 2.1 times more expensive than
+`MANUAL_OPTIMAL`, not five percent. Use the edge-aware figures for any
+comparison across routings with different edge mixes. The second caution is
+provenance, and it survives the correction above: the routed circuits'
+protected-or-bare verdicts come from the simulator's greedy downgrade search,
+whereas the hand-written circuits' `swap` and `swap_ft` choices are their
+author's, made by hand. The apples-to-apples comparison is to run the same
+greedy downgrade over the manual circuits and price the result, and it is worth
+doing --- it either lowers the manual circuits' cost, which sharpens the target,
+or it reports that some of their bare SWAPs need protection, which would be a
+finding about the reference itself. That check belongs to the sibling
 repository's evaluation work rather than to this plan.
 
 On completion of Gate 2, record the distribution of the qualifying-SWAP count
@@ -523,11 +534,40 @@ circuit order, which is where their verdicts should be read from. Comparing
 those two measures directly how order-dependent the verdicts are; Gate 0 did so
 and found no difference at all.
 
-The hardware facts this plan relies on, supplied by the hardware owner: the
-native two-qubit entangling gate is CZ; a bare SWAP is three CZ gates; a
-protected SWAP is nine, arranged as three bare SWAPs through an ancilla; a bare
-nearest-neighbour SWAP costs one unit of expected error and a protected one
-about seven and a half.
+The hardware facts this plan relies on, supplied by the hardware owner and
+re-confirmed by them on 2026-09-23. The native two-qubit entangling gate is CZ.
+A CZ has fidelity 0.9975 on a nearest-neighbour connection and 0.9861 on a
+next-nearest-neighbour one, so their infidelities are 0.0025 and 0.0139. A bare
+SWAP is three CZ gates on the connection it crosses. A protected SWAP between
+two nearest neighbours is nine CZ, arranged as three bare SWAPs through an
+ancilla --- and the third of those three runs on a next-nearest-neighbour
+connection, not a nearest-neighbour one, because the ancilla sits at the far
+vertex of one of the target's triangles and each triangle has two
+nearest-neighbour edges and one next-nearest-neighbour diagonal. A protected
+SWAP between two next-nearest neighbours is three of those, twenty-seven CZ.
+
+The unit of cost throughout this plan is the expected error of one bare
+nearest-neighbour SWAP, which is 3 x 0.0025 = 0.0075. Summing infidelities,
+which is valid while the individual rates are small, the four cases cost 1.00
+for a bare nearest-neighbour SWAP, 5.56 for a bare next-nearest-neighbour one,
+7.56 for a protected nearest-neighbour one --- the figure this plan rounds to
+seven and a half --- and 22.68 for a protected next-nearest-neighbour one. The
+next-nearest-neighbour leg is load-bearing in that 7.56: nine CZ priced entirely
+at nearest-neighbour fidelity would give 3.00, and an earlier estimate did
+exactly that. The derivation is reproduced in
+`cda-lab-notes/qec-rydberg-ions/2026-09-16_paper_framing.md` and written out as
+prose in `.agent/plans/fidelity-weighted-swap-cost.md`.
+
+A warning about the one-and-seven-and-a-half shorthand this plan uses for quick
+arithmetic. It prices every SWAP as though it crossed a nearest-neighbour
+connection, which is false for a routing that uses the diagonals, and the error
+is not uniform across circuits: `4.in` puts 27 of its 76 SWAPs on diagonals,
+`5.in` 2 of 84, and the two hand-compiled circuits none at all. Pricing each
+SWAP by the connection it actually crosses leaves `5.in` and both manual
+circuits within one to eight percent of their flat figures but doubles `4.in`,
+from 251.5 to 503.0. The shorthand is adequate for comparing two routings of
+similar edge mix and wrong for comparing routings that differ in it; state which
+is in use.
 
 ## Plan of Work
 
@@ -791,8 +831,10 @@ expression.
 
 The reasoning behind the rule, recorded so a later reader need not reconstruct
 it. A SWAP is three CZ gates on this hardware, and a protected SWAP is nine,
-arranged as three bare SWAPs through an ancilla. Protection is needed when a
-single fault on one of the two qubits could spread onto the other and produce a
+arranged as three bare SWAPs through an ancilla, the third of which crosses a
+diagonal --- see the orientation section, because that leg is what makes a
+protected SWAP cost 7.56 rather than 3.00. Protection is needed when a single
+fault on one of the two qubits could spread onto the other and produce a
 correlated error of weight two that the code cannot correct. If a two-qubit gate
 of the original circuit has just coupled exactly those two qubits, that path
 already existed and the original circuit was designed to tolerate it, so the

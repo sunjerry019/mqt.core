@@ -62,7 +62,23 @@ expected-error figure printed by the new statistic this plan adds.
   a naive gate count suggests. Evidence: on this target the three sites involved
   in a fault-tolerant SWAP form a triangle whose closing edge is a
   next-nearest-neighbour edge, so one of the three constituent bare SWAPs
-  necessarily crosses that more error-prone edge.
+  necessarily crosses that more error-prone edge. Confirmed by the hardware
+  owner on 2026-09-23; until then it was an inference from the target's
+  geometry.
+
+- Observation: the two hand-compiled reference circuits in the sibling
+  repository's `scripts/manual_compilations.py` never place a SWAP on a
+  diagonal. Every one of their 90 and 77 SWAPs runs along the chain, and the
+  diagonals (2,4), (5,7) and (8,10) appear only under two-qubit gates, where the
+  circuit's own comments name them explicitly ("over the (2,4) diagonal"). The
+  router does not follow that rule: `4.in` puts 27 of its 76 SWAPs on diagonals
+  and `5.in` 2 of 84. Pricing each SWAP by the connection it crosses rather than
+  flat, the four circuits cost 503.0, 307.0, 300.0 and 240.9 in units of a bare
+  nearest-neighbour SWAP, against flat figures of 251.5, 285.5, 298.0 and
+  239.5 --- so the edge mix alone doubles `4.in` and leaves the other three
+  almost unchanged. This is the most direct evidence yet that the edge-aware
+  half of this plan matters, and it suggests a sharper rule than a multiplier:
+  an expert uses a diagonal for a gate and never for a SWAP.
 
 ## Decision Log
 
@@ -178,9 +194,17 @@ respectively.
 The measured costs, expressed as multiples of the cost of a bare SWAP between
 two auxiliary qubits on an NN edge, are approximately 1.0, 3.2 and 6.5 on NN
 edges and 5.2, 11.0 and 19.5 on NNN edges, for the same three label pairs. These
-follow from four hardware and decomposition facts, which this plan takes as
-given and which the implementer should re-confirm with the hardware owner before
-trusting the resulting numbers:
+follow from four hardware and decomposition facts. The hardware owner
+re-confirmed the third and fourth of them on 2026-09-23, which were the two that
+had never been stated in their own words: an NN fault-tolerant SWAP is two bare
+NN SWAPs plus one bare NNN SWAP, and an NNN fault-tolerant SWAP is three of
+those. Both had previously been inferred from the phrase "2x NN CZ + 1x NNN CZ"
+read in SWAP units rather than CZ units, an inference recorded in
+`cda-lab-notes/qec-rydberg-ions/2026-09-16_paper_framing.md` and justified there
+only by consistency with the simulator's nine-CZ fault-tolerant SWAP. The first
+two facts, the CZ fidelities and the three-CZ bare SWAP, still rest on the
+hardware group's figures as transcribed into that note and should be
+re-confirmed before publication:
 
 First, the native two-qubit entangling gate is CZ. A CZ on an NN edge has
 fidelity 0.9975 and a CZ on an NNN edge has fidelity 0.9861, so their
