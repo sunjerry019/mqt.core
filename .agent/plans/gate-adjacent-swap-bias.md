@@ -133,6 +133,62 @@ rise with it.
   which is exactly what Gate 4 measures. Anyone running this should know the
   shape of the answer before seeing it.
 
+- Observation: the pattern this plan biases towards is the structural backbone
+  of an expert compilation rather than an incidental feature of router output.
+  Evidence: `scripts/manual_compilations.py` in the sibling repository, added
+  2026-09-22, spells out two hand-written Bacon-Shor memory rounds gate by gate
+  in physical-site terms. Applying the Milestone 1 predicate to their gate lists
+  gives 28 qualifying SWAPs out of 90 in `MANUAL_OPTIMAL` and 15 out of 77 in
+  `MANUAL_KATRIN`, against 5 out of 76 in `4.in` and 2 out of 84 in `5.in`. That
+  is a qualifying rate of 31 and 19 percent against 7 and 2 percent. The reason
+  the density is so much higher is visible in the circuits themselves: syndrome
+  extraction walks an ancilla along the chain, and the atomic step of that walk
+  is "read this data qubit, then step past it", which is a two-qubit gate
+  followed immediately by a SWAP on exactly that pair. The opportunity is
+  therefore inherent in the circuit being routed rather than rare, and the
+  router does not take it because nothing in its cost model tells it to. When
+  counting these, exclude the docstring of `_add_gates_optimal`, which lists the
+  available gate calls in the same `circuit.swap(q[a], q[b])` form as real gates
+  and inflates a naive text scan by two bare SWAPs, one protected SWAP and
+  several gates.
+
+- Observation: the premise now rests on fifty instances from two independent
+  sources rather than seven from one. Every one of the 43 qualifying SWAPs in
+  the two hand-written circuits is written as a plain `swap` and none as a
+  `swap_ft`, which is the same verdict the simulator gave on all seven
+  qualifying SWAPs in the routed circuits. The two sources are genuinely
+  independent: the routed verdicts come from the greedy downgrade search, the
+  hand-written ones from a person reasoning about the code directly.
+
+- Observation: among SWAPs that do *not* qualify, the fraction needing
+  protection is close to 0.375 in three of the four circuits regardless of who
+  produced them --- 27 of 71 in `4.in`, 31 of 82 in `5.in` and 23 of 62 in
+  `MANUAL_OPTIMAL`, which is 0.380, 0.378 and 0.371. `MANUAL_KATRIN` is the
+  outlier at 34 of 62, or 0.548. Taking 0.375 as the rate, a SWAP that does not
+  qualify costs an expected 0.375 x 7.5 + 0.625 x 1 = 3.44 units while a
+  qualifying one costs 1, so moving a single SWAP into the qualifying set is
+  worth about 2.44 units, or roughly seventy percent of that SWAP's expected
+  cost. This is the marginal number Gate 4 should be read against, and it is far
+  more useful than the doubling assumption the original ceiling calculation
+  used.
+
+- Observation: the reverse ordering is absent from the hand-written circuits
+  too. Scanning both manual compilations for a SWAP immediately followed by a
+  two-qubit gate on the same pair found zero occurrences, confirming on circuits
+  no router produced what the first entry in this section argued from the
+  search's early-exit. The argument and the evidence now agree from two
+  directions.
+
+- Observation: both hand-written circuits contain native three-qubit gates ---
+  three `ccz` and three `ccx` each. Four of the six act on sites 5, 6 and 7,
+  which is a triangle of the target, and two act on the fault-tolerant-swap
+  ancilla site, which carries no couplings and which the file itself marks
+  `OFF-MAP`. Milestone 1 already requires the any-arity tracking vector to be
+  updated for three-qubit gates; this is the evidence that such gates are not
+  hypothetical and that the requirement matters. It also settles the first open
+  question in the sibling repository's `.agent/plans/circuit-fidelity-scorer.md`
+  for the circuits that plan has to score, though not for router output.
+
 ## Decision Log
 
 - Decision: merge the measurement and the behaviour change into one plan with
@@ -200,6 +256,27 @@ rise with it.
   finding into `Outcomes & Retrospective` rather than deleting the plan.
   Date/Author: 2026-09-18, this plan.
 
+- Decision: keep the algebraic gate-and-SWAP fusion out of this plan and record
+  it as a separate follow-up that reuses this plan's predicate. Rationale: a
+  qualifying SWAP is cheap for two independent reasons and only one of them is a
+  routing decision. The first, which is this plan, is that it may stay
+  unprotected, worth about 6.5 units. The second is an exact circuit identity: a
+  two-qubit gate followed by a SWAP on the same pair is two entangling gates
+  rather than four, because SWAP is `C(x,y) C(y,x) C(x,y)` and the leading
+  factor annihilates the gate. The identity holds for CZ as well as for
+  controlled-NOT, since `SWAP . CZ` equals `(H (x) I) . SWAP . CNOT . (I (x) H)`
+  and is therefore locally equivalent to `SWAP . CNOT`, whose
+  two-entangling-gate realisation is the same one. That saving is about two
+  thirds of a unit per instance and, unlike the first, needs no fault-tolerance
+  premise at all: it is arithmetic. But realising it is a peephole rewrite
+  applied after routing, in a different pass, and folding it in here would break
+  the scope this plan is deliberately narrow about. The connection to record is
+  that the Milestone 1 statistic counts fusion opportunities and protection
+  opportunities with the same predicate, so this plan's instrumentation is also
+  the measurement instrument for that follow-up, and the discount makes both
+  payoffs larger together. Date/Author: 2026-09-22, this plan, prompted by the
+  arrival of `scripts/manual_compilations.py`.
+
 ## Outcomes & Retrospective
 
 **Gate 0, 2026-09-22: the premise holds; proceed.** Measured by
@@ -259,6 +336,57 @@ many SWAPs genuinely require protection rather than an exact count. On `4.in`
 the two opposite walk orders agree exactly, so on that routing the bound is
 tight; whether that survives to other routings is untested, `5.in` having been
 walked only once.
+
+**Gate 0 addendum, 2026-09-22: the ceiling is several times larger than the
+doubling assumption implied.** Two hand-compiled Bacon-Shor memory rounds
+arrived as `scripts/manual_compilations.py` in the sibling repository, and
+applying the Milestone 1 predicate to them gives qualifying rates of 31 percent
+(`MANUAL_OPTIMAL`, 28 of 90 SWAPs) and 19 percent (`MANUAL_KATRIN`, 15 of 77)
+against the router's 7 and 2 percent. The original ceiling assumed the discount
+doubles the qualifying count, which was a guess made with no evidence about what
+rate is attainable; there is now evidence, and it is between three and five
+times the router's rate.
+
+Recomputed with the expert rate in place of the doubling, and using the marginal
+figure of 2.44 units per SWAP moved into the qualifying set derived in
+`Surprises & Discoveries`: raising `4.in` from 5 qualifying SWAPs to 31 percent
+of 76, or about 24, is 19 SWAPs at 2.44 units, or 46 units against a total SWAP
+cost of 251.5 --- 18 percent. The same calculation on `5.in` gives 24 SWAPs at
+2.44 units, or 59 units against 285.5 --- 21 percent. The expected shape of the
+answer therefore moves from low single-digit percent to something closer to a
+fifth of the routing cost, and the recommendation to proceed past Gate 0 is now
+much better supported than it was.
+
+Three cautions attach to that number and none of them should be dropped when it
+is quoted. First, the hand-written circuits are not an achievability target for
+the router and the file says so in terms: they use moves that are out of spec,
+add resets the router would not, and exploit knowledge of which qubits are gauge
+qubits, and its author writes that reproducing them is explicitly not the aim.
+They establish that the opportunity exists in the circuit, not that a cost
+discount can capture it. Second, the marginal figure rests on a non-qualifying
+protection rate of 0.375, which three of the four circuits agree on closely but
+`MANUAL_KATRIN` contradicts at 0.548; if the true rate is nearer Katrin's the
+marginal value per SWAP rises rather than falls, so this caution runs in the
+favourable direction, but it means the rate is not yet established. Third, the
+ceiling remains a ceiling. Gate 4 measures what fraction of it the discount
+actually reaches, and a result far below it is still a legitimate outcome to
+record.
+
+One further asymmetry, which matters for any cost comparison against these
+circuits rather than for this plan's own arithmetic. Priced the same way, at one
+unit per bare SWAP and seven and a half per protected one, `MANUAL_OPTIMAL`
+scores 239.5 and `MANUAL_KATRIN` scores 298, against 251.5 for `4.in` and 285.5
+for `5.in`. Read naively that says the router is already within five percent of
+the expert compilation and beats the other one outright. Do not read it that way
+without checking, because the two sides do not have the same provenance: the
+routed circuits' protected-or-bare verdicts come from the simulator's greedy
+downgrade search, whereas the hand-written circuits' `swap` and `swap_ft`
+choices are their author's, made by hand. The apples-to-apples comparison is to
+run the same greedy downgrade over the manual circuits and price the result, and
+it is worth doing --- it either lowers the manual circuits' cost, which sharpens
+the target, or it reports that some of their bare SWAPs need protection, which
+would be a finding about the reference itself. That check belongs to the sibling
+repository's evaluation work rather than to this plan.
 
 On completion of Gate 2, record the distribution of the qualifying-SWAP count
 and of the total SWAP count across the measured seeds: mean, spread and range,
@@ -670,12 +798,19 @@ of the original circuit has just coupled exactly those two qubits, that path
 already existed and the original circuit was designed to tolerate it, so the
 SWAP adds no new uncorrectable path.
 
-A related circuit rewrite, which is not what this plan does but is worth reading
-for the algebra, is `CircuitOptimizer::cancelCNOTs` in
-`src/circuit_optimizer/CircuitOptimizer.cpp` at approximately lines 1182 to
-1202, which rewrites a controlled-NOT followed by a SWAP on the same pair into
-two controlled-NOTs. It belongs to the repository's legacy non-MLIR code path
-and is not wired into this pipeline.
+A related circuit rewrite, which is not what this plan does but which the
+`Decision Log` records as a follow-up sharing this plan's predicate, is
+`CircuitOptimizer::cancelCNOTs` in `src/circuit_optimizer/CircuitOptimizer.cpp`
+at approximately lines 1182 to 1202, which rewrites a controlled-NOT followed by
+a SWAP on the same pair into two controlled-NOTs. It belongs to the repository's
+legacy non-MLIR code path and is not wired into this pipeline. The hand-compiled
+circuits are direct evidence that this rewrite is worth having: their own source
+comment, under the heading `CNOT-SWAP CANCELLATION`, records that the reference
+they were transcribed from writes each read-and-step-past move already in the
+fused two-controlled-NOT form, and that the file untangles it back into a gate
+plus a plain SWAP only so that the gate list is readable. The reference
+compilation, in other words, takes this saving as a matter of course while the
+MLIR pipeline cannot take it at all.
 
 A caveat that applies to Gate 0 and to every number derived from the simulator:
 the verdicts come from a greedy, order-dependent, single-pass search, so they
