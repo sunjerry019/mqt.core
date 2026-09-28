@@ -226,8 +226,13 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
               "The multiplicative cost penalty applied to a SWAP "
               "whose edge is named in nnn-edges. Must be > 0. "
               "Only observable when nnn-edges is non-empty.">];
-  let statistics = [Statistic<"numSwaps", "num-inserted-swaps",
-                              "The number of inserted SWAPs">];
+  let statistics =
+      [Statistic<"numSwaps", "num-inserted-swaps",
+                 "The number of inserted SWAPs">,
+       Statistic<"numGateAdjacentSwaps", "num-gate-adjacent-swaps",
+                 "The number of inserted SWAP operations that acted on exactly "
+                 "the site pair of the immediately preceding two-qubit gate, "
+                 "with no intervening gate on either site.">];
 }
 
 //===----------------------------------------------------------------------===//

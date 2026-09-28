@@ -38,6 +38,14 @@ using ReadyMap = llvm::SmallDenseMap<Operation*, SmallVector<size_t>, 8>;
 using ReleasedOps = SmallVector<Operation*, 8>;
 using WalkProgramGraphFn =
     function_ref<WalkResult(const ReadyMap&, ReleasedOps&)>;
+/// Called for a single-qubit gate, `qco.reset`, or `qco.measure` (an
+/// operation of arity one) as the traversal silently advances a wire past
+/// it, with the operation and the index (into `wires`) of the wire it was
+/// found on. Never called for the purely structural ops (`qco.alloc`,
+/// `qco.static`, `qco.sink`, `qco.yield`, ...) that are also skipped, since
+/// those do not touch a qubit in any physical sense. Defaults to nothing,
+/// so passing no callback leaves this function's behavior unchanged.
+using SkippedOpFn = function_ref<void(Operation*, size_t)>;
 
 /**
  * @brief Walk the graph-like circuit IR of QCO dialect programs.
@@ -58,14 +66,24 @@ using WalkProgramGraphFn =
  * If the callback returns WalkResult::skip(), all ready operations will be
  * released.
  *
+ * A single-qubit gate, `qco.reset`, or `qco.measure` never appears in
+ * `ready`/`released`: this function silently traverses past it while
+ * looking for the next multi-qubit gate or barrier. A caller that needs to
+ * observe those operations anyway (for example, to know that *something*
+ * touched a qubit even though it never blocked on connectivity) can pass
+ * `skipped`, invoked once for each such operation as it is passed over.
+ *
  * @param wires A mutable array-ref of circuit wires (wire iterators).
  * @param fn The callback function.
+ * @param skipped Optional callback invoked for each skipped arity-one
+ * operation; see `SkippedOpFn`. Defaults to nothing.
  *
  * @returns success(), if all operations have been visited.
  */
 template <WireDirection Direction>
 LogicalResult walkProgramGraph(MutableArrayRef<WireIterator> wires,
-                               WalkProgramGraphFn fn) {
+                               WalkProgramGraphFn fn,
+                               SkippedOpFn skipped = {}) {
   using Traits = WireTraversalTraits<Direction>;
 
   struct IterationStep {
@@ -160,6 +178,9 @@ LogicalResult walkProgramGraph(MutableArrayRef<WireIterator> wires,
                   });
 
           if (skip || nqubits == 1) {
+            if (nqubits == 1 && skipped) {
+              skipped(it.operation(), i);
+            }
             std::ranges::advance(it, Traits::stride());
             continue;
           }

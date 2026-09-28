@@ -54,9 +54,13 @@ rise with it.
       The script is `scripts/gate_adjacent_swap_premise.py` in the sibling
       repository. The two opposite walk orders over `4.in` were also compared
       and agree on every SWAP.
-- [ ] **Gate 1.** Add the per-site gate tracking, the qualifying predicate and
-      the statistic. No routing decision changes.
-- [ ] Confirm routed output is unaffected by Milestone 1.
+- [x] (2026-09-26) **Gate 1.** Added the per-site gate tracking, the qualifying
+      predicate and the statistic; see `Surprises & Discoveries` for two things
+      that did not go as the plan anticipated, both resolved with the user's
+      input. No routing decision changes.
+- [x] (2026-09-26) Confirmed routed output is unaffected by Milestone 1: 89/89
+      mapping-pass GoogleTests and 2/2 Rydberg-ion GoogleTests pass, and the
+      Rydberg-ion binary was run three times in a row with identical results.
 - [ ] **Gate 2.** Add the multi-seed measurement loop and record the baseline
       distribution of the statistic.
 - [ ] **Gate 3.** Add the pass option, the activation flag and the discount.
@@ -188,6 +192,85 @@ rise with it.
   hypothetical and that the requirement matters. It also settles the first open
   question in the sibling repository's `.agent/plans/circuit-fidelity-scorer.md`
   for the circuits that plan has to score, though not for router output.
+
+- Observation: `generateLayout` runs up to `ntrials` trials concurrently via
+  `parallelForEach` (default `ntrials` is 4; the Rydberg-ion test overrides it
+  to 1). The plan's Milestone 1 text, "add two vectors to the state the routing
+  loop carries", is ambiguous between a `MappingPass` member (like
+  `qubitLabels`/`nnnEdgeSet`, which are safe because they are read-only after
+  being parsed once) and per-trial state. Since the two new tracking vectors
+  must be mutated inside `advance()`, which runs inside concurrently-executing
+  trials, a `MappingPass` member would be a real data race, exactly the scenario
+  the Milestone 1 acceptance criteria's required `ntrials > 1` test would
+  exercise. Implemented as fields of `RoutingBundle` instead (mirroring how
+  `Statistics` is already scoped per trial), reset at the start of every
+  `route()` call — which also naturally resets them at each nested-region
+  `dispatch()` boundary and between `generateLayout`'s forward/backward passes,
+  satisfying "reset for each routing pass" without extra plumbing.
+
+- Observation: `advance()` is built on the shared `walkProgramGraph` utility
+  (`mlir/include/mlir/Dialect/QCO/Utils/Drivers.h`), whose own doc comment says
+  it "traverses the def-use chain of each qubit until a multi-qubit gate
+  (including barriers) is found." Concretely, single-qubit gates, `qco.reset`,
+  and `qco.measure` are all classified as arity one and silently walked past —
+  they never appear in the `ready`/`released` sets `advance()`'s callback sees.
+  A first implementation of Milestone 1 therefore could not detect an
+  intervening single-qubit gate at all (confirmed empirically: inserting an `H`
+  between a qualifying gate and its SWAP left the statistic at 1, not 0). Fixed
+  by adding an optional `skipped` callback to `walkProgramGraph`, invoked for
+  exactly the arity-one operations it walks past (never for the purely
+  structural ops like `qco.alloc`/`qco.sink`/`qco.yield`, which do not touch a
+  qubit in any physical sense), defaulting to nothing so every other caller
+  (including `getWindow`) is unaffected. `qco.reset`/`qco.measure` disqualify a
+  pair the same way a single-qubit gate does, at the user's direction. A
+  dedicated toggle, `MappingPass::K_TRACK_ARITY_ONE_OPS_FOR_ GATE_ADJACENCY` (a
+  `static constexpr bool`, default `true`), turns off only this specific piece
+  of tracking — flipping it to `false` reverts to disqualifying a pair solely
+  via a second multi-qubit gate or a barrier — without touching anything else,
+  per the user's explicit request for an easy off-switch given how new and
+  untested this mechanism is.
+
+- Observation: with that fix in place, a SWAP that reuses a qubit's site as
+  workspace after that qubit has finished its own last gate is *reliably*
+  disqualified, because the router measures and sinks a "finished" qubit
+  immediately (as part of `advance()`'s ordinary eager wire-draining), and the
+  SWAP's operand genuinely flows through that measurement's result — a real
+  data-dependency, not a scheduling artifact. This is not a bug: the physical
+  qubit at that site has been measured, so any fault-path argument resting on
+  "this qubit was already coupled to its swap partner via the original gate" is
+  void. But it means every minimal hand-built test circuit tried (the
+  pre-existing triangle scenario already used by
+  `StatefulSwapLabelsChangeRoutingChoice`/`StatefulSwapLabelsPreferCheaper TypedSwap`,
+  and two different "ancilla steps past a data qubit" variants of four and more
+  qubits) exhibited this and could not be made to produce a small,
+  hand-derivable *qualifying* SWAP through the full pass: the shared qubit
+  common to the two gates that let a third gate execute always turned out to
+  have nothing left to do, and so was always measured first. Confirmed this is
+  not specific to the new circuits: re-running the pre-existing triangle
+  scenario (`qubitTypeLabels="BAA"`, seed 1) through the fixed implementation
+  now reports 0 qualifying SWAPs, where before this fix (with arity-one ops
+  invisible) it reported 1. `MappingPass` offers no way to pin an initial layout
+  directly to sidestep `generateLayout`'s randomization (and a target without
+  explicit topology is all-to-all, so no SWAP is ever needed there either), so
+  this could not be worked around by construction within the time spent trying.
+  Whoever runs Milestone 2's seed loop on the real Rydberg-ion/Bacon-Shor
+  circuit should watch for whether this pattern (measurement immediately
+  following a qubit's last gate) is common there too, since if so it would pull
+  the measured qualifying-SWAP count below what Gate 0's script — which scans a
+  pre-serialized gate list and has no concept of measurement or of
+  independent-wire scheduling at all — found on `4.in`/`5.in`. The two
+  instruments are not measuring quite the same thing.
+
+- Decision: at the user's direction, replace the Milestone 1 acceptance test
+  that traces a hand-built circuit through the full pass with a direct unit test
+  of `isGateAdjacentSwap` instead, given the difficulty above. Rationale: the
+  predicate itself (a four-way pointer comparison) is the part Milestone 1
+  actually adds and the part worth asserting on directly; it needs no routing
+  decision at all, only `Operation*` values used as opaque identity tokens. To
+  make this possible, `isGateAdjacentSwap` was pulled out of `MappingPass` into
+  a free function declared in the public `Mapping.h`, alongside
+  `createMappingPass`. Date/Author: 2026-09-26, this plan, at the user's
+  direction after reviewing the difficulty recorded above.
 
 ## Decision Log
 
@@ -766,6 +849,15 @@ single-qubit gate on one of the two qubits between the gate and the swap and
 assert the statistic reports zero. That second case is what proves the any-arity
 condition is enforced rather than accidentally satisfied.
 
+**Superseded, 2026-09-26, at the user's direction:** this could not be built
+through the full pass; see `Surprises & Discoveries` for why (every minimal
+circuit's shared qubit gets measured before the reused SWAP, itself correctly
+disqualifying it) and `Decision Log` for the replacement.
+`IsGateAdjacentSwapPredicate` unit-tests `isGateAdjacentSwap` directly instead,
+covering the matching-pair, mismatched-pair, both-null, and
+one-site-touched-since (standing in for the intervening single-qubit
+gate/reset/measurement) cases.
+
 The second proves Milestone 1 changed nothing observable: route the same circuit
 twice within one process with identical options and assert the SWAP count is
 identical and the statistic is no greater than it. The stronger guarantee, that
@@ -862,9 +954,16 @@ estimating how large that effect is.
 
 ## Interfaces and Dependencies
 
-No new libraries. The compiler changes are confined to `MLIRQCOTransforms` and
-its tablegen declaration. Gate 0 uses only the sibling repository's existing
-`src/mapper_output.py` and checked-in data.
+No new libraries. Milestone 1 additionally touched `MLIRQCOUtils`
+(`mlir/include/mlir/Dialect/QCO/Utils/Drivers.h`), beyond the
+`MLIRQCOTransforms` and tablegen scope originally stated here:
+`walkProgramGraph` gained an optional `skipped` callback, defaulting to nothing,
+to observe the single-qubit/reset/measure operations it silently traverses past,
+which `advance()` needed for the arity-one tracking recorded in
+`Surprises & Discoveries`. No other existing caller of `walkProgramGraph` (e.g.
+`getWindow`) passes this callback, so their behavior is unchanged. Gate 0 uses
+only the sibling repository's existing `src/mapper_output.py` and checked-in
+data.
 
 This plan has no prerequisite ExecPlans. It interacts with two:
 `.agent/plans/cost-weighted-trial-selection.md`, which is why measurement keeps

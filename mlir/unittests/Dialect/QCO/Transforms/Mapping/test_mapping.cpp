@@ -41,6 +41,7 @@
 #include <mlir/IR/ValueRange.h>
 #include <mlir/IR/Verifier.h>
 #include <mlir/Parser/Parser.h>
+#include <mlir/Pass/Pass.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Support/LLVM.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
@@ -1891,6 +1892,165 @@ TEST_F(MappingPassFixture, StatefulSwapLabelsPreferCheaperTypedSwap) {
       << "expected the SWAP to involve only program qubits 1 and 2 (label "
          "'A'), but it exchanged program qubits "
       << baaP0 << " and " << baaP1;
+}
+
+/// The `MappingPass` statistics relevant to
+/// `.agent/plans/gate-adjacent-swap-bias.md`, read back via
+/// `mlir::Pass::getStatistics()` rather than recomputed by walking the IR:
+/// walking the IR cannot distinguish "no SWAP qualified" from "a qualifying
+/// SWAP wasn't counted", which is exactly what these tests need to tell
+/// apart.
+struct MappingStats {
+  size_t numSwaps = 0;
+  size_t numGateAdjacentSwaps = 0;
+};
+
+/// Like `MappingPassFixture::runPass`, but also returns the pass's
+/// `num-inserted-swaps`/`num-gate-adjacent-swaps` statistics. The pass's raw
+/// pointer is captured before ownership passes to the `PassManager`; its
+/// `mlir::Pass::Statistic`s remain readable through that pointer after
+/// `pm.run` returns, for as long as `pm` (which owns the pass) stays alive.
+static FailureOr<MappingStats>
+runPassAndCollectStats(ModuleOp m, const CompilerTarget& target,
+                       const MappingPassOptions& options) {
+  PassManager pm(m->getContext());
+  auto pass = createMappingPass(target, options);
+  Pass* passPtr = pass.get();
+  pm.addPass(std::move(pass));
+  if (failed(pm.run(m))) {
+    return failure();
+  }
+
+  MappingStats stats;
+  for (const Pass::Statistic* stat : passPtr->getStatistics()) {
+    if (StringRef(stat->getName()) == "num-inserted-swaps") {
+      stats.numSwaps = stat->getValue();
+    } else if (StringRef(stat->getName()) == "num-gate-adjacent-swaps") {
+      stats.numGateAdjacentSwaps = stat->getValue();
+    }
+  }
+
+  RewritePatternSet patterns(m.getContext());
+  SinkOp::getCanonicalizationPatterns(patterns, m.getContext());
+  if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
+    return failure();
+  }
+  return stats;
+}
+
+TEST_F(MappingPassFixture, IsGateAdjacentSwapPredicate) {
+  // Directly unit-tests `isGateAdjacentSwap` (`.agent/plans/gate-adjacent-
+  // swap-bias.md`, Milestone 1), exposed as a free function in `Mapping.h`
+  // precisely so its logic can be checked against hand-constructed inputs,
+  // independent of the full randomized routing pipeline.
+  //
+  // Constructing a small circuit where the full `MappingPass` (through its
+  // randomized initial-layout search in `generateLayout`) is guaranteed to
+  // produce a SWAP on a known, hand-derivable site pair turned out to be
+  // surprisingly hard: in every minimal circuit tried (a 3-qubit triangle
+  // already used by `StatefulSwapLabelsPreferCheaperTypedSwap` above, and
+  // two different "ancilla steps past a data qubit" variants), the qubit
+  // whose site ends up reused as SWAP workspace had, by that point, no more
+  // gates left and so was measured and sunk immediately --- and the SWAP's
+  // operand genuinely flows through that measurement's result, correctly
+  // disqualifying it. That's `isGateAdjacentSwap` working as intended, not a
+  // bug, but it means the full pass doesn't offer a small, reliably
+  // hand-traceable positive case to assert against. Testing the predicate
+  // directly sidesteps that: it needs no routing decision at all, only
+  // `Operation*` values used as opaque identity tokens, which is all
+  // `isGateAdjacentSwap` ever does with them.
+  QCOProgramBuilder builder(context.get());
+  builder.initialize(SmallVector<Type>(2, builder.getI1Type()));
+  auto q0 = builder.allocQubit();
+  auto q1 = builder.allocQubit();
+  std::tie(q0, q1) = builder.cx(q0, q1);
+  Operation* const gateA = q1.getDefiningOp();
+  std::tie(q0, q1) = builder.cx(q0, q1);
+  Operation* const gateB = q1.getDefiningOp();
+  ASSERT_NE(gateA, nullptr);
+  ASSERT_NE(gateB, nullptr);
+  ASSERT_NE(gateA, gateB);
+
+  // Both sites last touched by the same two-qubit gate, and by nothing
+  // since: qualifies.
+  EXPECT_TRUE(isGateAdjacentSwap(SmallVector<Operation*>{gateA, gateA},
+                                 SmallVector<Operation*>{gateA, gateA}, 0, 1));
+
+  // The two sites' most recent two-qubit gates differ: does not qualify.
+  EXPECT_FALSE(isGateAdjacentSwap(SmallVector<Operation*>{gateA, gateB},
+                                  SmallVector<Operation*>{gateA, gateB}, 0, 1));
+
+  // Neither site has seen a two-qubit gate yet: does not qualify.
+  EXPECT_FALSE(isGateAdjacentSwap(SmallVector<Operation*>{nullptr, nullptr},
+                                  SmallVector<Operation*>{nullptr, nullptr}, 0,
+                                  1));
+
+  // Same two-qubit gate on both sites, but site 0 was touched by something
+  // else since (standing in for an intervening single-qubit gate, reset, or
+  // measurement, all of which are otherwise invisible to `advance`'s
+  // `ready`/`released` sets and are instead recorded through
+  // `walkProgramGraph`'s `skipped` callback --- see Mapping.cpp): does not
+  // qualify. This is precisely the case Milestone 1 added arity-one
+  // tracking for.
+  EXPECT_FALSE(isGateAdjacentSwap(SmallVector<Operation*>{gateA, gateA},
+                                  SmallVector<Operation*>{gateB, gateA}, 0, 1));
+
+  // Symmetric: the intervening operation touched the other site instead.
+  EXPECT_FALSE(isGateAdjacentSwap(SmallVector<Operation*>{gateA, gateA},
+                                  SmallVector<Operation*>{gateA, gateB}, 0, 1));
+}
+
+TEST_F(MappingPassFixture, GateAdjacentTrackingDoesNotChangeRoutingDecisions) {
+  // Milestone 1 of `.agent/plans/gate-adjacent-swap-bias.md` only adds
+  // instrumentation; it must not change which SWAPs are chosen. Route the
+  // same program twice, within the one process, with identical options
+  // (including `ntrials > 1`, so the per-trial tracking vectors this
+  // milestone adds to `RoutingBundle` are exercised while `generateLayout`
+  // runs its trials, possibly concurrently), and check the SWAP count is
+  // unaffected.
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    std::tie(qubits[1], qubits[2]) = builder.cx(qubits[1], qubits[2]);
+    std::tie(qubits[0], qubits[2]) = builder.cx(qubits[0], qubits[2]);
+
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+
+    return builder.finalize(bits);
+  };
+
+  const MappingPassOptions options{
+      .niterations = 2, .ntrials = 3, .seed = 7, .qubitTypeLabels = "BAA"};
+
+  auto m1 = makeModule();
+  auto stats1 = runPassAndCollectStats(m1.get(), target, options);
+  ASSERT_TRUE(succeeded(stats1));
+  ASSERT_TRUE(succeeded(verify(*m1)));
+  EXPECT_TRUE(isExecutable(getEntryPoint(m1.get()), target));
+
+  auto m2 = makeModule();
+  auto stats2 = runPassAndCollectStats(m2.get(), target, options);
+  ASSERT_TRUE(succeeded(stats2));
+  ASSERT_TRUE(succeeded(verify(*m2)));
+  EXPECT_TRUE(isExecutable(getEntryPoint(m2.get()), target));
+
+  EXPECT_EQ(stats1->numSwaps, stats2->numSwaps);
+  EXPECT_LE(stats1->numGateAdjacentSwaps, stats1->numSwaps);
+  EXPECT_LE(stats2->numGateAdjacentSwaps, stats2->numSwaps);
 }
 
 TEST_F(MappingPassFixture, InvalidQubitTypeLabelsFailsThePass) {

@@ -159,6 +159,11 @@ private:
   /// Statistics collected while routing.
   struct Statistics {
     size_t nswaps{0};
+    /// The number of inserted SWAPs that acted on exactly the site pair of
+    /// the immediately preceding two-qubit gate, with no intervening gate on
+    /// either site (see `isGateAdjacentSwap` and
+    /// `.agent/plans/gate-adjacent-swap-bias.md`).
+    size_t nGateAdjacentSwaps{0};
   };
 
   /// Parameters influencing the behavior of the A* search algorithm.
@@ -172,6 +177,19 @@ private:
     Wires wires;
     WireInfos infos;
     Layout layout;
+    /// Per-hardware-site most recent two-qubit gate to have acted on that
+    /// site, or null. Tracked only to support `isGateAdjacentSwap`; see
+    /// `.agent/plans/gate-adjacent-swap-bias.md`, Milestone 1. Sized and
+    /// reset to all-null at the start of every `route()` call, which is why
+    /// this lives per `RoutingBundle` (per trial, per nested-region
+    /// dispatch) rather than as pass-level state: `generateLayout` runs
+    /// multiple trials' `RoutingBundle`s concurrently.
+    SmallVector<Operation*> lastTwoQubitGate;
+    /// Per-hardware-site most recent gate of any arity (including a
+    /// `qco.barrier` or a single-qubit gate) to have acted on that site, or
+    /// null. Used together with `lastTwoQubitGate` to require that nothing
+    /// has touched either site since that two-qubit gate executed.
+    SmallVector<Operation*> lastAnyGate;
   };
 
   /// Describes a node in the A* search graph.
@@ -474,6 +492,7 @@ protected:
 
     // Collect statistics.
     numSwaps += stats.nswaps;
+    numGateAdjacentSwaps += stats.nGateAdjacentSwaps;
 
     // Fix SSA Dominance issues.
     for_each(body.getBlocks(), [](Block& b) { sortTopologically(&b); });
@@ -1388,14 +1407,35 @@ private:
     return window;
   }
 
+  /// Whether a single-qubit gate, `qco.reset`, or `qco.measure` on a site
+  /// invalidates that site's `lastTwoQubitGate` entry for `isGateAdjacentSwap`,
+  /// the same way a second two-qubit gate or a barrier always does. These
+  /// arity-one operations are otherwise invisible to `walkProgramGraph` (they
+  /// never appear in its `ready`/`released` sets; see `advance`'s use of
+  /// `SkippedOpFn`), so this is a separate, single place to turn that
+  /// specific piece of tracking off without touching anything else: flipping
+  /// it to `false` reverts to disqualifying a pair only via a second
+  /// multi-qubit gate or a barrier, leaving every other part of Milestone 1
+  /// (and, later, the discount) unchanged. See
+  /// `.agent/plans/gate-adjacent-swap-bias.md`, Milestone 1.
+  static constexpr bool K_TRACK_ARITY_ONE_OPS_FOR_GATE_ADJACENCY = true;
+
   /// Insert SWAP operations, exchanging two qubits, virtually
   /// (`RoutingMode::Cold`) or into the IR (`RoutingMode::Hot`). The function
   /// expects that each wire points at the correct insertion point.
   template <RoutingMode Mode>
   static void insertSWAPs(ArrayRef<IndexPairType> swaps, RoutingBundle& bundle,
                           Statistics& stats, IRRewriter* rewriter) {
-    auto& [wires, infos, layout] = bundle;
+    auto& [wires, infos, layout, lastTwoQubitGate, lastAnyGate] = bundle;
     for (const auto& [hw0, hw1] : swaps) {
+      // No gate executes while a search() is in progress, so the tracking
+      // vectors are an unchanging snapshot for every SWAP a single search
+      // emits; checking each SWAP against it here, after the fact, is
+      // equivalent to checking it at the moment of insertion.
+      if (isGateAdjacentSwap(lastTwoQubitGate, lastAnyGate, hw0, hw1)) {
+        ++stats.nGateAdjacentSwaps;
+      }
+
       const auto [prog0, prog1] = layout.getProgramIndices(hw0, hw1);
 
       if constexpr (Mode == RoutingMode::Hot) {
@@ -1435,9 +1475,22 @@ private:
   /// regions and the respective wire indices. Stops when no more executable
   /// gates are found. After the function returns, the wires point at the
   /// results of non-executable gates or operations with nested regions.
+  ///
+  /// For every gate released as executed, updates `lastAnyGate` for each
+  /// site it touches, and `lastTwoQubitGate` for both sites if it is a
+  /// two-qubit gate; see `isGateAdjacentSwap`. A `qco.barrier` updates only
+  /// `lastAnyGate`, since it is not a two-qubit gate itself but must still
+  /// invalidate any pair it touches. A single-qubit gate, `qco.reset`, or
+  /// `qco.measure` never reaches this function's `ready`/`released` sets at
+  /// all --- `walkProgramGraph` silently traverses past it while looking for
+  /// the next multi-qubit gate or barrier --- so those are instead observed
+  /// through `walkProgramGraph`'s `skipped` callback, gated on
+  /// `K_TRACK_ARITY_ONE_OPS_FOR_GATE_ADJACENCY`.
   template <WireDirection Direction>
   RecursiveRoutingStack advance(Wires& wires, const WireInfos& infos,
-                                const Layout& layout) {
+                                const Layout& layout,
+                                SmallVectorImpl<Operation*>& lastTwoQubitGate,
+                                SmallVectorImpl<Operation*>& lastAnyGate) {
     DenseSet<Operation*> visited;
     RecursiveRoutingStack stack;
 
@@ -1445,54 +1498,74 @@ private:
     // nested regions and the respective wire indices of their inputs onto the
     // result stack.
 
-    walkProgramGraph<Direction>(wires, [&](const ReadyMap& ready,
-                                           ReleasedOps& released) {
-      if (ready.empty()) {
-        return WalkResult::advance();
-      }
+    const auto onSkippedArityOneOp = [&](Operation* op, const size_t idx) {
+      lastAnyGate[layout.getHardwareIndex(infos.lookupProgram(idx))] = op;
+    };
 
-      for (const auto& [op, indices] : ready) {
-        if (isa<BarrierOp>(op)) {
-          released.emplace_back(op);
-          continue;
-        }
-
-        if (isa<UnitaryOpInterface>(op)) {
-          SmallVector<size_t, 3> hws;
-          hws.reserve(indices.size());
-          for (const size_t idx : indices) {
-            hws.push_back(layout.getHardwareIndex(infos.lookupProgram(idx)));
+    walkProgramGraph<Direction>(
+        wires,
+        [&](const ReadyMap& ready, ReleasedOps& released) {
+          if (ready.empty()) {
+            return WalkResult::advance();
           }
 
-          bool executable = true;
-          for (size_t i = 0; executable && i < hws.size(); ++i) {
-            for (size_t j = i + 1; j < hws.size(); ++j) {
-              if (!target->areAdjacent(hws[i], hws[j])) {
-                executable = false;
-                break;
+          for (const auto& [op, indices] : ready) {
+            if (isa<BarrierOp>(op)) {
+              for (const size_t idx : indices) {
+                lastAnyGate[layout.getHardwareIndex(infos.lookupProgram(idx))] =
+                    op;
               }
+              released.emplace_back(op);
+              continue;
+            }
+
+            if (isa<UnitaryOpInterface>(op)) {
+              SmallVector<size_t, 3> hws;
+              hws.reserve(indices.size());
+              for (const size_t idx : indices) {
+                hws.push_back(
+                    layout.getHardwareIndex(infos.lookupProgram(idx)));
+              }
+
+              bool executable = true;
+              for (size_t i = 0; executable && i < hws.size(); ++i) {
+                for (size_t j = i + 1; j < hws.size(); ++j) {
+                  if (!target->areAdjacent(hws[i], hws[j])) {
+                    executable = false;
+                    break;
+                  }
+                }
+              }
+
+              if (executable) {
+                for (const size_t hw : hws) {
+                  lastAnyGate[hw] = op;
+                }
+                if (hws.size() == 2) {
+                  lastTwoQubitGate[hws[0]] = op;
+                  lastTwoQubitGate[hws[1]] = op;
+                }
+                released.emplace_back(op);
+              }
+              continue;
+            }
+
+            if (op->getNumRegions() > 0 && visited.insert(op).second) {
+              assert((isa<scf::ForOp, scf::WhileOp, IfOp, IndexSwitchOp>(op)));
+              stack.emplace_back(op, indices);
+              continue;
             }
           }
 
-          if (executable) {
-            released.emplace_back(op);
+          if (released.empty()) {
+            return WalkResult::interrupt();
           }
-          continue;
-        }
 
-        if (op->getNumRegions() > 0 && visited.insert(op).second) {
-          assert((isa<scf::ForOp, scf::WhileOp, IfOp, IndexSwitchOp>(op)));
-          stack.emplace_back(op, indices);
-          continue;
-        }
-      }
-
-      if (released.empty()) {
-        return WalkResult::interrupt();
-      }
-
-      return WalkResult::advance();
-    });
+          return WalkResult::advance();
+        },
+        K_TRACK_ARITY_ONE_OPS_FOR_GATE_ADJACENCY
+            ? SkippedOpFn(onSkippedArityOneOp)
+            : SkippedOpFn());
 
     return stack;
   }
@@ -1785,12 +1858,23 @@ private:
     requires(Mode != RoutingMode::Hot || Direction == WireDirection::Forward)
   LogicalResult route(RoutingBundle& bundle, Statistics& stats,
                       IRRewriter* rewriter = nullptr) {
-    auto& [wires, infos, layout] = bundle;
+    auto& [wires, infos, layout, lastTwoQubitGate, lastAnyGate] = bundle;
+
+    // Reset the gate-adjacency tracking at the start of every routing
+    // episode this function is invoked for: once per forward/backward
+    // direction-pass of a top-level routing call, and once per nested-region
+    // dispatch, since `dispatch` constructs a fresh `RoutingBundle` per
+    // region and routes it through this same function. This is also what
+    // keeps a stale entry from leaking between `generateLayout`'s trials
+    // (which run concurrently) and refinement iterations.
+    lastTwoQubitGate.assign(target->numQubits(), nullptr);
+    lastAnyGate.assign(target->numQubits(), nullptr);
 
     while (true) {
 
       while (true) {
-        const auto stack = advance<Direction>(wires, infos, layout);
+        const auto stack = advance<Direction>(wires, infos, layout,
+                                              lastTwoQubitGate, lastAnyGate);
         if (stack.empty()) {
           break;
         }
@@ -1865,6 +1949,14 @@ private:
 std::unique_ptr<Pass> createMappingPass(const CompilerTarget& target,
                                         MappingPassOptions options) {
   return std::make_unique<MappingPass>(target, options);
+}
+
+bool isGateAdjacentSwap(const ArrayRef<Operation*> lastTwoQubitGate,
+                        const ArrayRef<Operation*> lastAnyGate, const size_t a,
+                        const size_t b) {
+  Operation* const gate = lastTwoQubitGate[a];
+  return gate != nullptr && gate == lastTwoQubitGate[b] &&
+         gate == lastAnyGate[a] && gate == lastAnyGate[b];
 }
 
 } // namespace mlir::qco
