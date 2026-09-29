@@ -61,8 +61,9 @@ rise with it.
 - [x] (2026-09-26) Confirmed routed output is unaffected by Milestone 1: 89/89
       mapping-pass GoogleTests and 2/2 Rydberg-ion GoogleTests pass, and the
       Rydberg-ion binary was run three times in a row with identical results.
-- [ ] **Gate 2.** Add the multi-seed measurement loop and record the baseline
-      distribution of the statistic.
+- [x] (2026-09-28) **Gate 2.** Added the multi-seed measurement loop
+      (`GateAdjacentSwapBaselineDistribution` in `test_rydberg_ions.cpp`) and
+      recorded the baseline distribution in `Outcomes & Retrospective`.
 - [ ] **Gate 3.** Add the pass option, the activation flag and the discount.
 - [ ] Add the GoogleTests described under Validation and Acceptance.
 - [ ] **Gate 4.** Measure the effect across seeds at several discount values and
@@ -485,6 +486,38 @@ repository's evaluation work rather than to this plan.
 On completion of Gate 2, record the distribution of the qualifying-SWAP count
 and of the total SWAP count across the measured seeds: mean, spread and range,
 not a single number.
+
+**Gate 2, 2026-09-28: baseline distribution measured.**
+`GateAdjacentSwapBaselineDistribution` in `test_rydberg_ions.cpp` routes the
+same twelve-qubit Bacon-Shor circuit used by the two existing Rydberg-ion tests
+(`qubitTypeLabels` nine `B` then three `A`, `nnnEdges` `2-4,5-7,8-10`, so both
+existing cost heuristics are active, matching
+`MapBaconShorCodeOnRydbergIonTarget`) once per seed, for seeds 0 through 29,
+with `ntrials` fixed at one per the `Decision Log`. It asserts nothing about the
+resulting numbers, only that each of the thirty routing attempts succeeds, and
+prints the mean, minimum and maximum of both `num-inserted-swaps` and
+`num-gate-adjacent-swaps` across the run.
+
+Because the pass is itself non-deterministic between process launches (the
+orientation section's `ReadyMap`-keyed-on-heap-address observation), the
+thirty-seed loop was itself run six times to see the spread between runs, not
+just within one. `num-inserted-swaps` means ranged from 92.43 to 95.80 across
+the six runs (one low outlier at 92.43, the other five within 0.5 of each
+other), with an overall minimum of 72 and an overall maximum of 120 across all
+seeds and all runs. `num-gate-adjacent-swaps` means ranged from 7.37 to 8.33,
+with an overall minimum of 1 and an overall maximum of 21. Taking a
+representative run (mean 95.63 total, mean 8.20 qualifying), the qualifying
+fraction is about 8.6 percent, which lines up with the 7 and 2 percent Gate 0
+measured on `4.in`/`5.in` and corroborates that those two statically-routed
+circuits are representative of what this pass produces on a comparable
+Bacon-Shor circuit, rather than an artifact of those two specific inputs.
+
+The full thirty-seed loop completed in 44 to 86 milliseconds end to end across
+the runs observed (including MLIR context and module construction for all thirty
+seeds, not routing alone), well inside the roughly one-second budget the plan
+estimated from a per-routing figure of about 36 milliseconds; the actual
+per-routing cost on this circuit is well under that figure, so the test needs no
+further guard against slowing the ordinary test run.
 
 On completion of Gate 4, record the same distributions at each discount value
 tried, and state plainly whether the count rose, whether total cost fell, and

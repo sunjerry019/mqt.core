@@ -30,6 +30,7 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/TypeSwitch.h>
 #include <llvm/Support/Debug.h>
+#include <llvm/Support/Format.h>
 #include <llvm/Support/LogicalResult.h>
 #include <llvm/Support/raw_ostream.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -46,6 +47,7 @@
 #include <mlir/IR/ValueRange.h>
 #include <mlir/IR/Verifier.h>
 #include <mlir/Parser/Parser.h>
+#include <mlir/Pass/Pass.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Support/LLVM.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
@@ -56,6 +58,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
@@ -647,6 +650,130 @@ TEST_F(RydbergIonMappingPassFixture, MapBaconShorCodeOnRydbergIonTarget) {
   EXPECT_EQ(numNativeMultiQubitGates, 6U)
       << "expected all 6 CCZ/CCX gates to survive routing as undecomposed, "
          "two-control CtrlOps";
+}
+
+namespace {
+
+/// The `MappingPass` statistics relevant to
+/// `.agent/plans/gate-adjacent-swap-bias.md`, read back via
+/// `mlir::Pass::getStatistics()` rather than recomputed by walking the IR:
+/// walking the IR cannot distinguish "no SWAP qualified" from "a qualifying
+/// SWAP wasn't counted", which is exactly what Milestone 2's measurement
+/// needs to tell apart.
+struct MappingStats {
+  size_t numSwaps = 0;
+  size_t numGateAdjacentSwaps = 0;
+};
+
+/// Like `RydbergIonMappingPassFixture::runPass`, but also returns the pass's
+/// `num-inserted-swaps`/`num-gate-adjacent-swaps` statistics. The pass's raw
+/// pointer is captured before ownership passes to the `PassManager`; its
+/// `mlir::Pass::Statistic`s remain readable through that pointer after
+/// `pm.run` returns, for as long as `pm` (which owns the pass) stays alive.
+FailureOr<MappingStats>
+runPassAndCollectStats(ModuleOp m, const CompilerTarget& target,
+                       const MappingPassOptions& options) {
+  PassManager pm(m->getContext());
+  auto pass = createMappingPass(target, options);
+  Pass* const passPtr = pass.get();
+  pm.addPass(std::move(pass));
+  if (failed(pm.run(m))) {
+    return failure();
+  }
+
+  MappingStats stats;
+  for (const Pass::Statistic* stat : passPtr->getStatistics()) {
+    if (StringRef(stat->getName()) == "num-inserted-swaps") {
+      stats.numSwaps = stat->getValue();
+    } else if (StringRef(stat->getName()) == "num-gate-adjacent-swaps") {
+      stats.numGateAdjacentSwaps = stat->getValue();
+    }
+  }
+
+  RewritePatternSet patterns(m.getContext());
+  SinkOp::getCanonicalizationPatterns(patterns, m.getContext());
+  if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
+    return failure();
+  }
+  return stats;
+}
+
+} // namespace
+
+/// Milestone 2 of `.agent/plans/gate-adjacent-swap-bias.md`: a measurement
+/// instrument, not a correctness check. Routes the same Bacon-Shor circuit
+/// once per seed, over at least thirty seeds within this one process, and
+/// prints the resulting distribution of the SWAP count and the Milestone 1
+/// gate-adjacent-SWAP count. Deliberately asserts nothing about those
+/// numbers themselves (only that each routing attempt succeeds): any
+/// threshold written here now would be a guess, and the whole point of this
+/// test is to print the baseline distribution for `Outcomes & Retrospective`
+/// and for Gate 4 to compare against later.
+///
+/// `ntrials` is kept at one, per the `Decision Log`: with more than one
+/// trial, `generateLayout` selects among trials by raw SWAP count, which can
+/// discard exactly the candidate a future discount would prefer, masking the
+/// effect this measurement exists to observe.
+TEST_F(RydbergIonMappingPassFixture, GateAdjacentSwapBaselineDistribution) {
+  constexpr size_t kNumSeeds = 30;
+
+  const auto target = getRydbergIonTarget();
+  const std::string qubitTypeLabels = std::string(9, 'B') + std::string(3, 'A');
+  const std::string nnnEdges = "2-4,5-7,8-10";
+
+  size_t minSwaps = std::numeric_limits<size_t>::max();
+  size_t maxSwaps = 0;
+  size_t totalSwaps = 0;
+  size_t minGateAdjacentSwaps = std::numeric_limits<size_t>::max();
+  size_t maxGateAdjacentSwaps = 0;
+  size_t totalGateAdjacentSwaps = 0;
+
+  for (size_t seed = 0; seed < kNumSeeds; ++seed) {
+    auto program = buildAndFinalizeBaconShorProgram(context.get());
+    auto& m = program.module;
+    ASSERT_TRUE(succeeded(verify(*m)));
+
+    const MappingPassOptions options{.nlookahead = kNLookahead,
+                                     .alpha = kAlpha,
+                                     .lambda = kLambda,
+                                     .niterations = kNIterations,
+                                     .ntrials = kNTrials,
+                                     .seed = seed,
+                                     .qubitTypeLabels = qubitTypeLabels,
+                                     .nnnEdges = nnnEdges};
+    const FailureOr<MappingStats> stats =
+        runPassAndCollectStats(m.get(), target, options);
+    ASSERT_TRUE(succeeded(stats)) << "routing failed at seed " << seed;
+
+    minSwaps = std::min(minSwaps, stats->numSwaps);
+    maxSwaps = std::max(maxSwaps, stats->numSwaps);
+    totalSwaps += stats->numSwaps;
+    minGateAdjacentSwaps =
+        std::min(minGateAdjacentSwaps, stats->numGateAdjacentSwaps);
+    maxGateAdjacentSwaps =
+        std::max(maxGateAdjacentSwaps, stats->numGateAdjacentSwaps);
+    totalGateAdjacentSwaps += stats->numGateAdjacentSwaps;
+  }
+
+  const double meanSwaps = static_cast<double>(totalSwaps) / kNumSeeds;
+  const double meanGateAdjacentSwaps =
+      static_cast<double>(totalGateAdjacentSwaps) / kNumSeeds;
+
+  llvm::outs()
+      << "\n"
+         "================================================================\n"
+         "Gate-adjacent-SWAP baseline distribution ("
+      << kNumSeeds << " seeds, ntrials=" << kNTrials
+      << ")\n"
+         "================================================================\n"
+      << "num-inserted-swaps:      mean=" << llvm::format("%.2f", meanSwaps)
+      << " min=" << minSwaps << " max=" << maxSwaps << "\n"
+      << "num-gate-adjacent-swaps: mean="
+      << llvm::format("%.2f", meanGateAdjacentSwaps)
+      << " min=" << minGateAdjacentSwaps << " max=" << maxGateAdjacentSwaps
+      << "\n"
+         "================================================================\n";
+  llvm::outs().flush();
 }
 
 TEST_F(RydbergIonMappingPassFixture,
