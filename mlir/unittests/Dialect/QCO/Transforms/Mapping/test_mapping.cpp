@@ -34,6 +34,7 @@
 #include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/DialectRegistry.h>
 #include <mlir/IR/Location.h>
+#include <mlir/IR/OperationSupport.h>
 #include <mlir/IR/OwningOpRef.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/Types.h>
@@ -2262,6 +2263,66 @@ TEST_F(MappingPassFixture, NnnEdgeCostComposesWithTypedCost) {
          "from the edge used when only qubit-type-labels was set";
 }
 
+TEST_F(MappingPassFixture, GateAdjacentSwapDiscountInertAtDefault) {
+  // Milestone 3 of `.agent/plans/gate-adjacent-swap-bias.md`: at its default
+  // value of one, `gateAdjacentSwapDiscount` must leave routing decisions
+  // completely unchanged, whether the option is left unset (the implicit
+  // default) or set to `1` explicitly. `qubitTypeLabels` is also set here so
+  // that `useTypedCost` is true in both runs, exercising the three-way guard
+  // `useTypedCost || useEdgeCost || useGateAdjacentCost` with a real
+  // heuristic already active rather than only the all-off case.
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    std::tie(qubits[1], qubits[2]) = builder.cx(qubits[1], qubits[2]);
+    std::tie(qubits[0], qubits[2]) = builder.cx(qubits[0], qubits[2]);
+
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+
+    return builder.finalize(bits);
+  };
+
+  auto moduleDefault = makeModule();
+  ASSERT_TRUE(runPass(moduleDefault.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .qubitTypeLabels = "BAA"})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleDefault)));
+
+  auto moduleExplicit = makeModule();
+  ASSERT_TRUE(runPass(moduleExplicit.get(), target,
+                      MappingPassOptions{.niterations = 1,
+                                         .ntrials = 1,
+                                         .seed = 1,
+                                         .qubitTypeLabels = "BAA",
+                                         .gateAdjacentSwapDiscount = 1.0F})
+                  .succeeded());
+  ASSERT_TRUE(succeeded(verify(*moduleExplicit)));
+
+  EXPECT_TRUE(mlir::OperationEquivalence::isEquivalentTo(
+      moduleDefault->getOperation(), moduleExplicit->getOperation(),
+      mlir::OperationEquivalence::Flags::None))
+      << "expected leaving gate-adjacent-swap-discount at its default (1) to "
+         "route identically whether the option is left unset or set "
+         "explicitly";
+}
+
 TEST_F(MappingPassFixture, InvalidNnnEdgesSpecFailsThePass) {
   const CompilerTarget target(
       3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
@@ -2540,6 +2601,109 @@ TEST_F(MappingPassFixture,
       StringRef(diagnostics)
           .contains("decompose it to one- and two-qubit operations first"))
       << diagnostics;
+}
+
+TEST_F(MappingPassFixture, GateAdjacentSwapDiscountBreaksATie) {
+  // Milestone 3 of `.agent/plans/gate-adjacent-swap-bias.md`: the discount
+  // must change which SWAP the search picks, not merely leave a statistic
+  // higher after the fact.
+  //
+  // The plain triangle circuit already used throughout this file (CX(A,B),
+  // CX(B,C), CX(A,C) on this same 3-node path target) turned out to be
+  // unusable for this: on a 3-node path, the single SWAP it ever needs
+  // always has its site pair touched again by the *other* flanking gate
+  // before the SWAP is inserted, so it can never satisfy the "nothing in
+  // between" condition -- the same structural difficulty already recorded
+  // in `Surprises & Discoveries` for Milestone 1's original acceptance test.
+  // Confirmed empirically: `num-gate-adjacent-swaps` stayed 0 for that
+  // circuit across many seeds, with or without the discount enabled.
+  //
+  // Appending one more gate, CX(A,B), after the usual triangle-closing
+  // CX(A,C) (the user's suggestion) does produce a genuine case. At seed 1,
+  // with no other heuristic enabled, the SWAP that routes the third gate
+  // (CX(A,C)) ties between hardware edges (0,1) and (1,2) under the plain
+  // graph-distance heuristic -- confirmed the same way
+  // `NnnEdgeCostChangesRoutingChoice` confirms its own tie: naming the
+  // baseline winner, (0,1), in `nnn-edges` with a large multiplier flips the
+  // choice to (1,2). At the moment of that SWAP, edge (1,2) is exactly the
+  // site pair CX(B,C) (the immediately preceding gate) acted on, with
+  // nothing since touching either site: the qualifying, gate-adjacent
+  // candidate. Left at its default, the search happens to prefer (0,1)
+  // instead; a discount well below one must flip the first SWAP to (1,2).
+  const CompilerTarget target(
+      3, std::vector<CompilerTarget::Coupling>{{0, 1}, {1, 2}});
+
+  const auto makeModule = [&]() {
+    QCOProgramBuilder builder(context.get());
+    builder.initialize(SmallVector<Type>(3, builder.getI1Type()));
+
+    SmallVector<Value> qubits(3);
+    SmallVector<Value> bits(3);
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      qubits[i] = builder.allocQubit();
+    }
+
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+    std::tie(qubits[1], qubits[2]) = builder.cx(qubits[1], qubits[2]);
+    std::tie(qubits[0], qubits[2]) = builder.cx(qubits[0], qubits[2]);
+    std::tie(qubits[0], qubits[1]) = builder.cx(qubits[0], qubits[1]);
+
+    for (size_t i = 0; i < qubits.size(); ++i) {
+      std::tie(qubits[i], bits[i]) = builder.measure(qubits[i]);
+      builder.sink(qubits[i]);
+    }
+
+    return builder.finalize(bits);
+  };
+
+  // Route with `options` and return the hardware site pair of the first
+  // emitted SWAP.
+  const auto firstSwapSites =
+      [&](const MappingPassOptions& options) -> std::pair<int64_t, int64_t> {
+    auto m = makeModule();
+    EXPECT_TRUE(runPass(m.get(), target, options).succeeded());
+    EXPECT_TRUE(succeeded(verify(*m)));
+
+    DenseMap<Value, CompilerTarget::SiteId> siteOf;
+    for (Operation& opRef : getEntryPoint(m.get()).getFunctionBody().front()) {
+      Operation* op = &opRef;
+      if (auto staticOp = dyn_cast<StaticOp>(op)) {
+        siteOf.try_emplace(staticOp.getQubit(), staticOp.getIndex());
+        continue;
+      }
+      if (auto unitaryOp = dyn_cast<UnitaryOpInterface>(op)) {
+        for (const auto [pred, succ] : llvm::zip_equal(
+                 unitaryOp.getInputQubits(), unitaryOp.getOutputQubits())) {
+          siteOf.try_emplace(succ, siteOf.at(pred));
+        }
+        if (auto swapOp = dyn_cast<SWAPOp>(op)) {
+          return {siteOf.at(swapOp.getQubit0In()),
+                  siteOf.at(swapOp.getQubit1In())};
+        }
+      }
+    }
+    ADD_FAILURE() << "expected at least one SWAP";
+    return {-1, -1};
+  };
+
+  const auto isEdge = [](const auto& sites, int64_t a, int64_t b) {
+    return (sites.first == a && sites.second == b) ||
+           (sites.first == b && sites.second == a);
+  };
+
+  const auto baselineSites = firstSwapSites(
+      MappingPassOptions{.niterations = 1, .ntrials = 1, .seed = 1});
+  EXPECT_TRUE(isEdge(baselineSites, 0, 1))
+      << "expected the untouched default to prefer edge (0,1)";
+
+  const auto discountedSites =
+      firstSwapSites(MappingPassOptions{.niterations = 1,
+                                        .ntrials = 1,
+                                        .seed = 1,
+                                        .gateAdjacentSwapDiscount = 0.1F});
+  EXPECT_TRUE(isEdge(discountedSites, 1, 2))
+      << "expected the discount to flip the first SWAP onto (1,2), the site "
+         "pair CX(B,C) just acted on";
 }
 
 INSTANTIATE_TEST_SUITE_P(TenByTenSquareGrid, MappingPassTest,

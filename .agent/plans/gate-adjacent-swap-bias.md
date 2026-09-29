@@ -66,7 +66,9 @@ rise with it.
       recorded the baseline distribution in `Outcomes & Retrospective`.
 - [x] (2026-09-29) **Gate 3.** Added the pass option, the activation flag and
       the discount.
-- [ ] Add the GoogleTests described under Validation and Acceptance.
+- [x] (2026-09-29) Added the GoogleTests described under Validation and
+      Acceptance: `GateAdjacentSwapDiscountInertAtDefault` and
+      `GateAdjacentSwapDiscountBreaksATie` in `test_mapping.cpp`.
 - [ ] **Gate 4.** Measure the effect across seeds at several discount values and
       decide whether to keep the option. Record the decision either way.
 
@@ -273,6 +275,93 @@ rise with it.
   a free function declared in the public `Mapping.h`, alongside
   `createMappingPass`. Date/Author: 2026-09-26, this plan, at the user's
   direction after reviewing the difficulty recorded above.
+
+- Observation: the same difficulty recorded above for Milestone 1's original
+  acceptance test recurred, in a different shape, while building Milestone 3's
+  second acceptance test ("the discount changes a decision"). Two attempts at a
+  hand-built circuit failed before a third, suggested by the user, worked; all
+  three were checked with a throwaway diagnostic `TEST_F` in `test_mapping.cpp`
+  (never committed) that ran `runPassAndCollectStats` and a small per-op
+  site-tracing helper across several seeds, then removed once the working
+  circuit was confirmed.
+
+  First attempt: the plain triangle circuit already used throughout
+  `test_mapping.cpp` (CX(A,B), CX(B,C), CX(A,C) on the 3-node path target 0-1-2,
+  the same one `StatefulSwapLabelsChangeRoutingChoice` and
+  `NnnEdgeCostChangesRoutingChoice` use). `num-gate-adjacent-swaps` stayed 0
+  across seeds 0-4, with and without the discount enabled (checked at
+  `gateAdjacentSwapDiscount = 0.5`). The reason is structural, not incidental:
+  on a 3-node path, the single SWAP this circuit ever needs reuses the *middle*
+  site, which every routed trace showed was touched by the gate that executes
+  right after the SWAP's own site pair was last used by a gate, before the SWAP
+  is even inserted --- specifically, at seed 1, the SWAP always lands on the
+  site pair of the *first* CX, but the *second* CX touches one of those same two
+  sites before the SWAP is chosen, so the "nothing in between" condition is
+  always violated. This is the same shape of difficulty already recorded above
+  for Milestone 1 (there, a shared qubit was reliably measured before its site
+  could be reused; here, a shared *site* is reliably re-touched by a later gate
+  before the SWAP that would reuse it), just with a different specific
+  mechanism.
+
+  User's understanding: There is a measure on each qubit after the circuit, so
+  on the third gate, the measure already moves forward through the third gate,
+  thereby touching the qubit that is in the adjacent gate pair, disqualifying
+  it. Adding a 4th gate after that prevents that from happening, and allows the
+  adjacent gate to reliably show up for the SWAP.
+
+  Second attempt: a purpose-built 4-qubit "ancilla steps past a data qubit"
+  circuit on a 4-node path target (sites 0-1-2-3), with program qubits A
+  (ancilla), D0, D1 and X, and gates CX(A,D0), CX(D0,X), CX(A,D1) --- D0 given a
+  further pending gate with X specifically so it would not be measured and sunk
+  immediately after CX(A,D0), which is exactly what disqualified every minimal
+  circuit Milestone 1 tried (see above). This avoided that specific
+  disqualification, but failed for an unrelated reason: `generateLayout`'s
+  initial-layout search (active even at `niterations = 1`) found a starting
+  layout that made every gate immediately executable, so the pass needed zero
+  SWAPs and never invoked `search()` at all, across seeds 0-4.
+
+  Third attempt, suggested by the user and confirmed working: append one more
+  gate, CX(A,B), after the usual triangle-closing CX(A,C), on the same 3-node
+  path target and the same three qubits A, B, C. At seed 1, with no other
+  heuristic enabled: CX(A,B) and CX(B,C) execute first (on sites (0,1) and (1,2)
+  respectively), then the search needed to route CX(A,C) ties between hardware
+  edges (0,1) and (1,2), and picks (0,1). Confirmed this is a genuine tie, not
+  (0,1) being robustly preferred for some other reason, the same way
+  `NnnEdgeCostChangesRoutingChoice`'s own docstring justifies its tie claim:
+  naming (0,1) in `nnn-edges` with a 3x multiplier --- a probe entirely
+  independent of the new discount code --- flips the choice to (1,2). At the
+  moment of that SWAP, edge (1,2) is exactly the site pair CX(B,C) (the
+  immediately preceding gate) acted on, with nothing since touching either site:
+  the qualifying, gate-adjacent candidate. With
+  `gateAdjacentSwapDiscount = 0.1`, the first SWAP reliably flips from (0,1) to
+  (1,2) --- checked across seeds 0-7 and `niterations` 1-2, uniformly.
+
+  A caveat worth recording for whoever next hand-traces this pass with debug
+  output: `insertSWAPs` is called many more times than the final SWAP count
+  suggests, because `generateLayout`'s forward/backward initial-layout
+  refinement (active even at `niterations = 1`) also routes the program
+  internally, in `RoutingMode::Cold`, to evaluate candidate layouts, and those
+  internal routing calls go through the exact same `search()`/`insertSWAPs`
+  machinery with their own, separately-scoped `Statistics` objects that are
+  discarded rather than accumulated into the pass's reported
+  `num-inserted-swaps`/`num-gate-adjacent-swaps`. A temporary debug print placed
+  directly inside `insertSWAPs` during this investigation showed seven
+  invocations for a run whose reported statistics reflect only two real SWAPs;
+  reasoning about "which SWAP is the Nth one" from such a print requires knowing
+  which invocations belong to the final `RoutingMode::Hot` pass and which belong
+  to a discarded refinement trial, which is not obvious from the print alone.
+  This diagnostic print was never committed.
+
+  A second caveat: which specific hardware edge ends up "the" gate-adjacent one
+  for this circuit is seed-dependent, because it depends on which sites
+  `generateLayout` happens to place A, B and C on initially. At seed 0, the same
+  circuit ties between the same two edges but with the *roles reversed*:
+  baseline prefers (1,2) and the discount flips it to (0,1) instead --- the
+  qualitative pattern (discount flips the tie toward whichever edge is
+  gate-adjacent) is seed-independent, but the specific edge identities are not,
+  so a test built on a fixed seed must use the edges observed for that exact
+  seed rather than assuming which one "should" be gate-adjacent from
+  hand-derivation alone.
 
 ## Decision Log
 
@@ -545,6 +634,19 @@ roughly doubled to 16.90–18.97 while the total-SWAP mean stayed in a comparabl
 range (96.90–102.83), which is enough to confirm the option is correctly wired
 end to end. It is not a substitute for Gate 4's proper measurement across
 discount values.
+
+**Milestone 3 GoogleTests, 2026-09-29: both added and passing.**
+`GateAdjacentSwapDiscountInertAtDefault` routes the standard triangle circuit
+twice with `qubitTypeLabels = "BAA"` (so `useTypedCost` is active in both runs),
+once with `gateAdjacentSwapDiscount` left unset and once set to `1.0F`
+explicitly, and asserts the two routed modules are
+`OperationEquivalence::isEquivalentTo`. `GateAdjacentSwapDiscountBreaksATie`
+uses the third hand-built circuit described in `Surprises & Discoveries` above
+(CX(A,B), CX(B,C), CX(A,C), CX(A,B)) at seed 1, and asserts the first emitted
+SWAP is edge (0,1) at the default discount and edge (1,2) --- the gate-adjacent
+candidate --- at `gateAdjacentSwapDiscount = 0.1`. Both pass reliably across
+repeated runs (checked 5x for the tie-breaking test, 3x for the full 91-test
+suite), and 89/89 pre-existing mapping-pass tests are unaffected.
 
 On completion of Gate 4, record the same distributions at each discount value
 tried, and state plainly whether the count rose, whether total cost fell, and
