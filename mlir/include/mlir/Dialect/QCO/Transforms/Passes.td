@@ -185,6 +185,20 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
 
     `h(n)` is unaffected. The heuristic is opt-in and disabled by default (an empty `nnn-edges`), preserving the
     default routing behavior regardless of `nnn-cost-multiplier` or `qubit-type-labels`.
+
+    The pass optionally applies a further discount to a SWAP that immediately follows, on exactly the same site
+    pair, a two-qubit gate of the original circuit with nothing in between touching either site, opted into via the
+    `gate-adjacent-swap-discount` option (see `num-gate-adjacent-swaps` above for the exact qualifying condition).
+    Only the first SWAP inserted by a single `search()` invocation can ever qualify, because the condition requires a
+    gate to have just executed and no gate executes while a search is in progress. When `gate-adjacent-swap-discount`
+    is set to a value other than `1`, a qualifying first SWAP on the path from the root to a search node `n` has its
+    cost multiplied by that factor, on top of whatever cost `qubit-type-labels` and `nnn-edges` would otherwise
+    assign it (or on top of the flat cost of `1` if neither is set). Unlike the other two heuristics, enabling this
+    one on its own turns `g(n)` from `alpha * depth(n)` into `alpha * cost(n)`, where `cost(n)` is `1` per SWAP except
+    a qualifying first SWAP, which costs `gate-adjacent-swap-discount` instead --- a different objective from the
+    default that a reader should not assume is unchanged just because the other two heuristics are off. `h(n)` is
+    unaffected. The heuristic is opt-in and disabled by default (`gate-adjacent-swap-discount` of `1`), preserving
+    the default routing behavior.
   }];
   let options =
       [Option<"nlookahead", "nlookahead", "std::size_t", "1",
@@ -225,7 +239,21 @@ def MappingPass : Pass<"place-and-route", "mlir::ModuleOp"> {
        Option<"nnnCostMultiplier", "nnn-cost-multiplier", "float", "3.0F",
               "The multiplicative cost penalty applied to a SWAP "
               "whose edge is named in nnn-edges. Must be > 0. "
-              "Only observable when nnn-edges is non-empty.">];
+              "Only observable when nnn-edges is non-empty.">,
+       Option<"gateAdjacentSwapDiscount", "gate-adjacent-swap-discount",
+              "float", "1.0F",
+              "Opt-in multiplicative discount applied to a SWAP's "
+              "cost when it acts on exactly the site pair a "
+              "two-qubit gate has just acted on, with nothing in "
+              "between touching either site (see "
+              "num-gate-adjacent-swaps). Only the first SWAP of a "
+              "search can ever qualify. With qubit-type-labels and "
+              "nnn-edges both left at their defaults, enabling "
+              "this option alone still changes g(n) from "
+              "alpha * depth(n) to a weighted SWAP count, which is "
+              "a different objective from the default even though "
+              "every non-qualifying SWAP still costs 1. A value of "
+              "1 (the default) disables the heuristic.">];
   let statistics =
       [Statistic<"numSwaps", "num-inserted-swaps",
                  "The number of inserted SWAPs">,

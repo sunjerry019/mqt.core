@@ -213,29 +213,41 @@ private:
     /// Whether the NN/NNN edge-cost heuristic is opted into for this
     /// search. Copied down from the root node.
     bool useEdgeCost;
+    /// Whether the gate-adjacent-SWAP discount is opted into for this
+    /// search (`gateAdjacentSwapDiscount != 1`). Copied down from the root
+    /// node. See `.agent/plans/gate-adjacent-swap-bias.md`, Milestone 3.
+    bool useGateAdjacentCost;
     float f;
 
     /// Construct a root node with the given layout. Initialize the
     /// sequence with an empty vector and set the cost to zero.
-    Node(Layout layout, const bool useTypedCost, const bool useEdgeCost)
+    Node(Layout layout, const bool useTypedCost, const bool useEdgeCost,
+         const bool useGateAdjacentCost)
         : layout(std::move(layout)), parent(nullptr), depth(0), pathCost(0),
-          useTypedCost(useTypedCost), useEdgeCost(useEdgeCost), f(0) {}
+          useTypedCost(useTypedCost), useEdgeCost(useEdgeCost),
+          useGateAdjacentCost(useGateAdjacentCost), f(0) {}
 
     /// Construct a non-root node from its parent node. Apply the given swap to
     /// the layout of the parent node. If the stateful A/B swap heuristic is
     /// enabled, `qubitLabels` (indexed by program qubit) determines the
     /// type-dependent cost contributed by this SWAP. If the NN/NNN edge-cost
     /// heuristic is enabled, a SWAP whose hardware edge is contained in
-    /// `nnnEdges` has its cost multiplied by `nnnCostMultiplier`.
+    /// `nnnEdges` has its cost multiplied by `nnnCostMultiplier`. If the
+    /// gate-adjacent-SWAP discount is enabled and this is the first SWAP of
+    /// the search (`depth == 1`), a SWAP whose site pair is in
+    /// `gateAdjacentPairs` has its cost multiplied by
+    /// `gateAdjacentSwapDiscount` on top of that.
     Node(Node* parent, const IndexPairType& swap, const Window& window,
          const CompilerTarget& target, const Parameters& params,
          ArrayRef<QubitLabel> qubitLabels,
-         const DenseSet<IndexPairType>& nnnEdges, const float nnnCostMultiplier)
+         const DenseSet<IndexPairType>& nnnEdges, const float nnnCostMultiplier,
+         const DenseSet<IndexPairType>& gateAdjacentPairs,
+         const float gateAdjacentSwapDiscount)
         : layout(parent->layout), swap(swap), parent(parent),
           depth(parent->depth + 1), pathCost(parent->pathCost),
           useTypedCost(parent->useTypedCost), useEdgeCost(parent->useEdgeCost),
-          f(0) {
-      if (useTypedCost || useEdgeCost) {
+          useGateAdjacentCost(parent->useGateAdjacentCost), f(0) {
+      if (useTypedCost || useEdgeCost || useGateAdjacentCost) {
         float base = 1.0F;
         if (useTypedCost) {
           const auto [prog0, prog1] =
@@ -244,7 +256,20 @@ private:
         }
         const float edgeMultiplier =
             (useEdgeCost && nnnEdges.contains(swap)) ? nnnCostMultiplier : 1.0F;
-        pathCost += base * edgeMultiplier;
+        float cost = base * edgeMultiplier;
+        if (useGateAdjacentCost && depth == 1 &&
+            gateAdjacentPairs.contains(swap)) {
+          // Only the first SWAP of a search (depth 1) may ever be
+          // discounted; see the duplicate-state pruning hazard described in
+          // `.agent/plans/gate-adjacent-swap-bias.md`. This assertion guards
+          // the invariant directly at the site that applies the discount,
+          // so a future edit cannot decouple the multiplication from the
+          // depth check without tripping it.
+          assert(depth == 1 &&
+                 "gate-adjacent-swap discount applied at depth != 1");
+          cost *= gateAdjacentSwapDiscount;
+        }
+        pathCost += cost;
       }
       layout.swap(swap.first, swap.second);
       f = g(params.alpha) + h(window, target, params); // NOLINT
@@ -271,11 +296,11 @@ private:
   private:
     /// Calculate the path cost for the A* search algorithm.
     /// The path costs are the weighted sum of the currently required SWAPs.
-    /// If the stateful A/B swap heuristic or the NN/NNN edge-cost heuristic
-    /// is enabled, the flat per-SWAP cost is replaced by the cost
-    /// accumulated in `pathCost`.
+    /// If the stateful A/B swap heuristic, the NN/NNN edge-cost heuristic, or
+    /// the gate-adjacent-SWAP discount is enabled, the flat per-SWAP cost is
+    /// replaced by the cost accumulated in `pathCost`.
     [[nodiscard]] float g(const float alpha) const {
-      return alpha * ((useTypedCost || useEdgeCost)
+      return alpha * ((useTypedCost || useEdgeCost || useGateAdjacentCost)
                           ? pathCost
                           : static_cast<float>(depth));
     }
@@ -1107,8 +1132,10 @@ private:
   /// impractical runtimes on larger architectures.
   ///
   /// Returns `failure`, if the A* search fails.
-  FailureOr<SmallVector<IndexPairType>> search(const Window& window,
-                                               const Layout& layout) const {
+  FailureOr<SmallVector<IndexPairType>>
+  search(const Window& window, const Layout& layout,
+         ArrayRef<Operation*> lastTwoQubitGate,
+         ArrayRef<Operation*> lastAnyGate) const {
     constexpr size_t cap = 25'000'000UL;
 
     const size_t b = target->maxDegree() * ((target->numQubits() + 1) / 2);
@@ -1116,13 +1143,35 @@ private:
 
     const Parameters params{.alpha = alpha, .lambda = lambda};
 
+    const bool useGateAdjacentCost = gateAdjacentSwapDiscount != 1.0F;
+
+    // The set of site pairs qualifying for the gate-adjacent-SWAP discount,
+    // computed once here, before the search begins, from the gate-adjacency
+    // tracking as it stands at the moment the search is invoked. No gate
+    // executes while a search is in progress, so this set does not change
+    // during the search, and only the first SWAP of the search (depth 1) can
+    // ever match it; see `.agent/plans/gate-adjacent-swap-bias.md`,
+    // Milestone 3. Left empty (and left uncomputed) when the discount is
+    // disabled.
+    DenseSet<IndexPairType> gateAdjacentPairs;
+    if (useGateAdjacentCost) {
+      for (size_t siteA = 0; siteA < target->numQubits(); ++siteA) {
+        for (size_t siteB = siteA + 1; siteB < target->numQubits(); ++siteB) {
+          if (isGateAdjacentSwap(lastTwoQubitGate, lastAnyGate, siteA, siteB)) {
+            gateAdjacentPairs.insert({siteA, siteB});
+          }
+        }
+      }
+    }
+
     llvm::SpecificBumpPtrAllocator<Node> arena;
     llvm::PriorityQueue<Node*, std::vector<Node*>, Node::ComparePointer>
         frontier;
 
     // Early exit, if the root node is a goal node already.
-    Node* root = std::construct_at(arena.Allocate(), layout,
-                                   !qubitLabels.empty(), !nnnEdgeSet.empty());
+    Node* root =
+        std::construct_at(arena.Allocate(), layout, !qubitLabels.empty(),
+                          !nnnEdgeSet.empty(), useGateAdjacentCost);
     if (root->isGoal(window.front(), *target)) {
       return SmallVector<IndexPairType>{};
     }
@@ -1184,7 +1233,8 @@ private:
 
           frontier.emplace(std::construct_at(
               arena.Allocate(), curr, swap, window, *target, params,
-              ArrayRef(qubitLabels), nnnEdgeSet, nnnCostMultiplier));
+              ArrayRef(qubitLabels), nnnEdgeSet, nnnCostMultiplier,
+              gateAdjacentPairs, gateAdjacentSwapDiscount));
         });
       }
 
@@ -1891,7 +1941,7 @@ private:
         break;
       }
 
-      const auto swaps = search(window, layout);
+      const auto swaps = search(window, layout, lastTwoQubitGate, lastAnyGate);
       if (failed(swaps)) {
         return failure();
       }

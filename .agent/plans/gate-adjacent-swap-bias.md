@@ -64,7 +64,8 @@ rise with it.
 - [x] (2026-09-28) **Gate 2.** Added the multi-seed measurement loop
       (`GateAdjacentSwapBaselineDistribution` in `test_rydberg_ions.cpp`) and
       recorded the baseline distribution in `Outcomes & Retrospective`.
-- [ ] **Gate 3.** Add the pass option, the activation flag and the discount.
+- [x] (2026-09-29) **Gate 3.** Added the pass option, the activation flag and
+      the discount.
 - [ ] Add the GoogleTests described under Validation and Acceptance.
 - [ ] **Gate 4.** Measure the effect across seeds at several discount values and
       decide whether to keep the option. Record the decision either way.
@@ -518,6 +519,32 @@ seeds, not routing alone), well inside the roughly one-second budget the plan
 estimated from a per-routing figure of about 36 milliseconds; the actual
 per-routing cost on this circuit is well under that figure, so the test needs no
 further guard against slowing the ordinary test run.
+
+**Gate 3, 2026-09-29: the discount is implemented and wired through both
+guards.** `gate-adjacent-swap-discount` was added to `def MappingPass` in
+`Passes.td`, type `float`, default `1.0F`, with a prose paragraph in the style
+of the two existing heuristic paragraphs. In `Mapping.cpp`, `search()` now takes
+`lastTwoQubitGate`/`lastAnyGate` and, only when the discount differs from one,
+computes the set of qualifying site pairs once before the search begins by
+scanning all site pairs with `isGateAdjacentSwap` (cheap: target sizes here are
+a dozen or so sites). `Node` gained a third activation flag,
+`useGateAdjacentCost`, included in both guards the orientation section warned
+about (`useTypedCost || useEdgeCost || useGateAdjacentCost`, in the cost
+accumulation and in `g()`), and the node constructor multiplies by the discount
+only when `depth == 1` and the swap is in the qualifying set, guarded by an
+`assert(depth == 1 ...)` placed directly at the multiplication site.
+
+Verified inertness at the default: 89/89 mapping-pass GoogleTests and 3/3
+Rydberg-ion GoogleTests pass unchanged with the option left at `1`, and three
+repeated runs of the Rydberg-ion binary's seed loop landed inside the Gate 2
+baseline range (means 93.33–97.40 total SWAPs, 7.27–8.50 qualifying). As an
+informal sanity check (not the Gate 4 measurement, which needs at least thirty
+seeds compared properly), the seed loop was also run three times with the
+discount temporarily set to `0.1` and then reverted: the qualifying-SWAP mean
+roughly doubled to 16.90–18.97 while the total-SWAP mean stayed in a comparable
+range (96.90–102.83), which is enough to confirm the option is correctly wired
+end to end. It is not a substitute for Gate 4's proper measurement across
+discount values.
 
 On completion of Gate 4, record the same distributions at each discount value
 tried, and state plainly whether the count rose, whether total cost fell, and
